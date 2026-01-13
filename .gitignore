@@ -1,0 +1,40 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.cache/
+cache/
+
+# Virtual envs
+.env
+.venv/
+venv/
+ENV/
+
+# Image files
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.gif
+*.tiff
+*.webp
+
+# NumPy / binary data files
+*.npy
+*.npz
+
+# Archives
+*.zip
+
+# Zarr stores
+*.zarr
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Ignore rivanna_dl directory and all its contents
+rivanna_dl/
