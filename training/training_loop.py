@@ -108,7 +108,7 @@ def training_loop(
     encoder = dnnlib.util.construct_class_by_name(**encoder_kwargs)
     ref_image = encoder.encode_latents(torch.as_tensor(ref_image).to(device).unsqueeze(0))
     dist.print0('Constructing network...')
-    interface_kwargs = dict(img_resolution=ref_image.shape[-1], img_channels=ref_image.shape[1], label_dim=ref_label.shape[-1])
+    interface_kwargs = dict(img_resolution=ref_image.shape[-1], img_channels=ref_image.shape[1], label_dim=ref_label.shape[-1], context_dim=ref_label.shape[-1]) # context_dim for crossattention **new**
     net = dnnlib.util.construct_class_by_name(**network_kwargs, **interface_kwargs)
     net.train().requires_grad_(True).to(device)
 

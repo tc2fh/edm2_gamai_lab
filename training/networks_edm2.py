@@ -12,7 +12,61 @@ import numpy as np
 import torch
 from torch_utils import persistence
 from torch_utils import misc
+from einops import rearrange, repeat
 
+from inspect import isfunction
+def exists(val):
+    return val is not None
+
+def default(val, d):
+    if exists(val):
+        return val
+    return d() if isfunction(d) else d
+
+@persistence.persistent_class
+class CrossAttention(torch.nn.Module):
+    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.):
+        super().__init__()
+        inner_dim = dim_head * heads
+        context_dim = default(context_dim, query_dim)
+
+        self.scale = dim_head ** -0.5
+        self.heads = heads
+
+        self.to_q = torch.nn.Linear(query_dim, inner_dim, bias=False)
+        self.to_k = torch.nn.Linear(context_dim, inner_dim, bias=False)
+        self.to_v = torch.nn.Linear(context_dim, inner_dim, bias=False)
+
+        self.to_out = torch.nn.Sequential(
+            torch.nn.Linear(inner_dim, query_dim),
+            torch.nn.Dropout(dropout)
+        )
+
+    def forward(self, x, context=None, mask=None):
+        h = self.heads
+
+        q = self.to_q(x)
+        context = default(context, x)
+        k = self.to_k(context)
+        v = self.to_v(context)
+
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
+
+        sim = torch.einsum('b i d, b j d -> b i j', q, k) * self.scale
+
+        if exists(mask):
+            mask = rearrange(mask, 'b ... -> b (...)')
+            max_neg_value = -torch.finfo(sim.dtype).max
+            mask = repeat(mask, 'b j -> (b h) () j', h=h)
+            sim.masked_fill_(~mask, max_neg_value)
+
+        # attention, what we cannot get enough of
+        attn = sim.softmax(dim=-1)
+
+        out = torch.einsum('b i j, b j d -> b i d', attn, v)
+        out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
+        return self.to_out(out)
+    
 #----------------------------------------------------------------------------
 # Normalize given tensor to unit magnitude with respect to the given
 # dimensions. Default = all dimensions except the first.
@@ -116,6 +170,7 @@ class Block(torch.nn.Module):
         in_channels,                    # Number of input channels.
         out_channels,                   # Number of output channels.
         emb_channels,                   # Number of embedding channels.
+        context_dim = 0,              # Context dimensionality for VIVIT embeddings. 0 = no cross-attention. **new**
         flavor              = 'enc',    # Flavor: 'enc' or 'dec'.
         resample_mode       = 'keep',   # Resampling: 'keep', 'up', or 'down'.
         resample_filter     = [1,1],    # Resampling filter.
@@ -124,6 +179,7 @@ class Block(torch.nn.Module):
         dropout             = 0,        # Dropout probability.
         res_balance         = 0.3,      # Balance between main branch (0) and residual branch (1).
         attn_balance        = 0.3,      # Balance between main branch (0) and self-attention (1).
+        cross_attn_balance    = 0.3,      # Balance between self-attention (0) and cross-attention (1). **new**
         clip_act            = 256,      # Clip output activations. None = do not clip.
     ):
         super().__init__()
@@ -132,9 +188,11 @@ class Block(torch.nn.Module):
         self.resample_filter = resample_filter
         self.resample_mode = resample_mode
         self.num_heads = out_channels // channels_per_head if attention else 0
+        self.crossattn_heads = out_channels // channels_per_head
         self.dropout = dropout
         self.res_balance = res_balance
         self.attn_balance = attn_balance
+        self.cross_attn_balance = cross_attn_balance #torch.nn.Parameter(torch.tensor(cross_attn_balance)) consider making this a learnable parameter
         self.clip_act = clip_act
         self.emb_gain = torch.nn.Parameter(torch.zeros([]))
         self.conv_res0 = MPConv(out_channels if flavor == 'enc' else in_channels, out_channels, kernel=[3,3])
@@ -144,7 +202,17 @@ class Block(torch.nn.Module):
         self.attn_qkv = MPConv(out_channels, out_channels * 3, kernel=[1,1]) if self.num_heads != 0 else None
         self.attn_proj = MPConv(out_channels, out_channels, kernel=[1,1]) if self.num_heads != 0 else None
 
-    def forward(self, x, emb):
+        # Cross-attention layers for VIVIT. **new**
+        self.cross_attn = None
+        if context_dim != 0:
+            self.cross_attn = CrossAttention(query_dim=out_channels, 
+            context_dim=context_dim, 
+            heads=self.crossattn_heads, 
+            dim_head=channels_per_head, 
+            dropout=dropout
+            )
+
+    def forward(self, x, emb, context=None):
         # Main branch.
         x = resample(x, f=self.resample_filter, mode=self.resample_mode)
         if self.flavor == 'enc':
@@ -176,6 +244,33 @@ class Block(torch.nn.Module):
             y = torch.einsum('nhqk,nhck->nhcq', w, v)
             y = self.attn_proj(y.reshape(*x.shape))
             x = mp_sum(x, y, t=self.attn_balance)
+
+        # Cross-Attention Logic for VIVIT. **new**
+        '''
+        Because cross attention uses the intermediate as the query in each block, we need to apply cross attention here.
+        in the compvis code, they only do this crossattention at resolutions that have attention.
+        We may want to consider this, the xs edm2 presets may not include that by default
+        https://github.com/CompVis/latent-diffusion/tree/main
+        '''
+        if self.cross_attn is not None and context is not None:
+            # Reshape x from (B, C, H, W) to (B, H*W, C) for the Linear Attention
+            b, c, h, w = x.shape
+            spatial_x = rearrange(x, 'b c h w -> b (h w) c')
+            
+            # Apply Cross Attention
+            # x is Query (B, HW, C)
+            # context is Key/Value (B, T, D) (VIVIT Embeddings)
+            attn_out = self.cross_attn(spatial_x, context=context)
+            
+            # Reshape back to (B, C, H, W)
+            attn_out = rearrange(attn_out, 'b (h w) c -> b c h w', h=h, w=w)
+            
+            # EDM2 Integration
+            # Standard Linear layers do not preserve unit variance. 
+            # Because EDM2 requires normalization to unit variance, we try using their normalization function. 
+            attn_out = normalize(attn_out, dim=1)
+
+            x = mp_sum(x, attn_out, t=self.cross_attn_balance)
 
         # Clip activations.
         if self.clip_act is not None:
@@ -212,7 +307,7 @@ class UNet(torch.nn.Module):
         # Embedding.
         self.emb_fourier = MPFourier(cnoise)
         self.emb_noise = MPConv(cnoise, cemb, kernel=[])
-        self.emb_label = MPConv(label_dim, cemb, kernel=[]) if label_dim != 0 else None
+        # self.emb_label = MPConv(label_dim, cemb, kernel=[]) if label_dim != 0 else None # don't need this anymore
 
         # Encoder.
         self.enc = torch.nn.ModuleDict()
@@ -248,23 +343,34 @@ class UNet(torch.nn.Module):
 
     def forward(self, x, noise_labels, class_labels):
         # Embedding.
+        
+        '''
+        With the new cross attention logic for VIVIT, we replace "class labels" in the zip dataset with VIVIT embeddings
+            we will pass "class_labels" (which are now VIVIT embeddings) as context to the cross attention layers in each block.
+        '''
         emb = self.emb_noise(self.emb_fourier(noise_labels))
-        if self.emb_label is not None:
-            emb = mp_sum(emb, self.emb_label(class_labels * np.sqrt(class_labels.shape[1])), t=self.label_balance)
+        # if self.emb_label is not None:
+            # emb = mp_sum(emb, self.emb_label(class_labels * np.sqrt(class_labels.shape[1])), t=self.label_balance)
         emb = mp_silu(emb)
 
         # Encoder.
         x = torch.cat([x, torch.ones_like(x[:, :1])], dim=1)
         skips = []
         for name, block in self.enc.items():
-            x = block(x) if 'conv' in name else block(x, emb)
+            x = block(x) if 'conv' in name else block(x, emb, context=class_labels)
             skips.append(x)
 
         # Decoder.
         for name, block in self.dec.items():
             if 'block' in name:
                 x = mp_cat(x, skips.pop(), t=self.concat_balance)
-            x = block(x, emb)
+            
+            # Pass emb and context to ALL blocks (upsample/in/block), excluding final out_conv
+            if isinstance(block, Block):
+                x = block(x, emb, context=class_labels)
+            else:
+                x = block(x) # Fallback for non-Block layers if any
+
         x = self.out_conv(x, gain=self.out_gain)
         return x
 
@@ -276,7 +382,7 @@ class Precond(torch.nn.Module):
     def __init__(self,
         img_resolution,         # Image resolution.
         img_channels,           # Image channels.
-        label_dim,              # Class label dimensionality. 0 = unconditional.
+        label_dim,              # Class label dimensionality. 0 = unconditional. Note: for VIVIT, this is the embedding dimensionality, not the number of class labels. **new**
         use_fp16        = True, # Run the model at FP16 precision?
         sigma_data      = 0.5,  # Expected standard deviation of the training data.
         logvar_channels = 128,  # Intermediate dimensionality for uncertainty estimation.
@@ -285,7 +391,7 @@ class Precond(torch.nn.Module):
         super().__init__()
         self.img_resolution = img_resolution
         self.img_channels = img_channels
-        self.label_dim = label_dim
+        self.label_dim = label_dim #label_dim is now VIVIT embedding dimensionality, not class label dimensionality
         self.use_fp16 = use_fp16
         self.sigma_data = sigma_data
         self.unet = UNet(img_resolution=img_resolution, img_channels=img_channels, label_dim=label_dim, **unet_kwargs)
@@ -295,7 +401,14 @@ class Precond(torch.nn.Module):
     def forward(self, x, sigma, class_labels=None, force_fp32=False, return_logvar=False, **unet_kwargs):
         x = x.to(torch.float32)
         sigma = sigma.to(torch.float32).reshape(-1, 1, 1, 1)
-        class_labels = None if self.label_dim == 0 else torch.zeros([1, self.label_dim], device=x.device) if class_labels is None else class_labels.to(torch.float32).reshape(-1, self.label_dim)
+        
+        # class_labels = None if self.label_dim == 0 else torch.zeros([1, self.label_dim], device=x.device) if class_labels is None else class_labels.to(torch.float32).reshape(-1, self.label_dim)
+
+        #NOTE: this will error if embeddings aren't passed
+        #assert class_labels (context) has a sequence dimension (B, T, D) for cross attention
+        assert class_labels is not None and class_labels.ndim == 3, "class_labels (context) must be a 3D tensor (Batch, Sequence, Dim)"
+        class_labels = class_labels.to(torch.float32) #pass through as is
+        
         dtype = torch.float16 if (self.use_fp16 and not force_fp32 and x.device.type == 'cuda') else torch.float32
 
         # Preconditioning weights.
