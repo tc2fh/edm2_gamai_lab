@@ -117,7 +117,7 @@ def training_loop(
         misc.print_module_summary(net, [
             torch.zeros([batch_gpu, net.img_channels, net.img_resolution, net.img_resolution], device=device),
             torch.ones([batch_gpu], device=device),
-            torch.zeros([batch_gpu, net.label_dim], device=device),
+            torch.zeros([batch_gpu, 1, net.label_dim], device=device),
         ], max_nesting=2)
 
     # Setup training state.

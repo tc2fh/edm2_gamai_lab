@@ -12,6 +12,7 @@ cache/
 .venv/
 venv/
 ENV/
+.pixi/
 
 # Image files
 *.png
@@ -38,3 +39,7 @@ Thumbs.db
 
 # Ignore rivanna_dl directory and all its contents
 rivanna_dl/
+.claude
+# pixi environments
+.pixi/*
+!.pixi/config.toml

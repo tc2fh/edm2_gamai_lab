@@ -9,6 +9,7 @@
 
 import os
 import re
+import csv
 import warnings
 import click
 import tqdm
@@ -141,6 +142,15 @@ class StackedRandomGenerator:
 # Returns an iterable that yields
 # dnnlib.EasyDict(images, labels, noise, batch_idx, num_batches, indices, seeds)
 
+def load_embedding_csv(path):
+    """Load a VIVIT embedding from a CSV file. Returns the first row as (1, 1, D) tensor."""
+    with open(path) as f:
+        reader = csv.reader(f)
+        next(reader)  # skip header
+        first_row = next(reader)
+        embedding = [float(x) for x in first_row[1:]]  # skip index column
+    return torch.tensor(embedding, dtype=torch.float32).reshape(1, 1, -1)  # (1, 1, D)
+
 def generate_images(
     net,                                        # Main network. Path, URL, or torch.nn.Module.
     gnet                = None,                 # Guiding network. None = same as main network.
@@ -149,6 +159,7 @@ def generate_images(
     subdirs             = False,                # Create subdirectory for every 1000 seeds?
     seeds               = range(16, 24),        # List of random seeds.
     class_idx           = None,                 # Class label. None = select randomly.
+    embeddings          = None,                 # Path to VIVIT embedding CSV file. None = use class labels.
     max_batch_size      = 32,                   # Maximum batch size for the diffusion model.
     encoder_batch_size  = 4,                    # Maximum batch size for the encoder. None = default.
     verbose             = True,                 # Enable status prints?
@@ -216,7 +227,11 @@ def generate_images(
                     rnd = StackedRandomGenerator(device, r.seeds)
                     r.noise = rnd.randn([len(r.seeds), net.img_channels, net.img_resolution, net.img_resolution], device=device)
                     r.labels = None
-                    if net.label_dim > 0:
+                    if embeddings is not None:
+                        # Load VIVIT embedding from CSV and broadcast to batch size
+                        emb = load_embedding_csv(embeddings).to(device)  # (1, 1, D)
+                        r.labels = emb.expand(len(r.seeds), -1, -1)  # (B, 1, D)
+                    elif net.label_dim > 0:
                         r.labels = torch.eye(net.label_dim, device=device)[rnd.randint(net.label_dim, size=[len(r.seeds)], device=device)]
                         if class_idx is not None:
                             r.labels[:, :] = 0
@@ -268,6 +283,7 @@ def parse_int_list(s):
 @click.option('--subdirs',                  help='Create subdirectory for every 1000 seeds',                        is_flag=True)
 @click.option('--seeds',                    help='List of random seeds (e.g. 1,2,5-10)', metavar='LIST',            type=parse_int_list, default='16-19', show_default=True)
 @click.option('--class', 'class_idx',       help='Class label  [default: random]', metavar='INT',                   type=click.IntRange(min=0), default=None)
+@click.option('--embeddings',               help='Path to VIVIT embedding CSV file for conditioning', metavar='PATH', type=str, default=None)
 @click.option('--batch', 'max_batch_size',  help='Maximum batch size', metavar='INT',                               type=click.IntRange(min=1), default=32, show_default=True)
 
 @click.option('--steps', 'num_steps',       help='Number of sampling steps', metavar='INT',                         type=click.IntRange(min=1), default=32, show_default=True)

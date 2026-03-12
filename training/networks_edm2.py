@@ -307,50 +307,53 @@ class UNet(torch.nn.Module):
         # Embedding.
         self.emb_fourier = MPFourier(cnoise)
         self.emb_noise = MPConv(cnoise, cemb, kernel=[])
-        # self.emb_label = MPConv(label_dim, cemb, kernel=[]) if label_dim != 0 else None # don't need this anymore
+        self.emb_label = MPConv(label_dim, cemb, kernel=[]) if label_dim != 0 else None  # FiLM: project pooled VIVIT embedding into noise embedding space
+
+        # Extract context_dim from block_kwargs; only pass it at attn_resolutions.
+        ctx_dim = block_kwargs.pop('context_dim', 0)
 
         # Encoder.
         self.enc = torch.nn.ModuleDict()
         cout = img_channels + 1
         for level, channels in enumerate(cblock):
             res = img_resolution >> level
+            use_ctx = ctx_dim if (res in attn_resolutions) else 0
             if level == 0:
                 cin = cout
                 cout = channels
                 self.enc[f'{res}x{res}_conv'] = MPConv(cin, cout, kernel=[3,3])
             else:
-                self.enc[f'{res}x{res}_down'] = Block(cout, cout, cemb, flavor='enc', resample_mode='down', **block_kwargs)
+                self.enc[f'{res}x{res}_down'] = Block(cout, cout, cemb, flavor='enc', resample_mode='down', context_dim=use_ctx, **block_kwargs)
             for idx in range(num_blocks):
                 cin = cout
                 cout = channels
-                self.enc[f'{res}x{res}_block{idx}'] = Block(cin, cout, cemb, flavor='enc', attention=(res in attn_resolutions), **block_kwargs)
+                self.enc[f'{res}x{res}_block{idx}'] = Block(cin, cout, cemb, flavor='enc', attention=(res in attn_resolutions), context_dim=use_ctx, **block_kwargs)
 
         # Decoder.
         self.dec = torch.nn.ModuleDict()
         skips = [block.out_channels for block in self.enc.values()]
         for level, channels in reversed(list(enumerate(cblock))):
             res = img_resolution >> level
+            use_ctx = ctx_dim if (res in attn_resolutions) else 0
             if level == len(cblock) - 1:
-                self.dec[f'{res}x{res}_in0'] = Block(cout, cout, cemb, flavor='dec', attention=True, **block_kwargs)
-                self.dec[f'{res}x{res}_in1'] = Block(cout, cout, cemb, flavor='dec', **block_kwargs)
+                self.dec[f'{res}x{res}_in0'] = Block(cout, cout, cemb, flavor='dec', attention=True, context_dim=use_ctx, **block_kwargs)
+                self.dec[f'{res}x{res}_in1'] = Block(cout, cout, cemb, flavor='dec', context_dim=use_ctx, **block_kwargs)
             else:
-                self.dec[f'{res}x{res}_up'] = Block(cout, cout, cemb, flavor='dec', resample_mode='up', **block_kwargs)
+                self.dec[f'{res}x{res}_up'] = Block(cout, cout, cemb, flavor='dec', resample_mode='up', context_dim=use_ctx, **block_kwargs)
             for idx in range(num_blocks + 1):
                 cin = cout + skips.pop()
                 cout = channels
-                self.dec[f'{res}x{res}_block{idx}'] = Block(cin, cout, cemb, flavor='dec', attention=(res in attn_resolutions), **block_kwargs)
+                self.dec[f'{res}x{res}_block{idx}'] = Block(cin, cout, cemb, flavor='dec', attention=(res in attn_resolutions), context_dim=use_ctx, **block_kwargs)
         self.out_conv = MPConv(cout, img_channels, kernel=[3,3])
 
     def forward(self, x, noise_labels, class_labels):
         # Embedding.
-        
-        '''
-        With the new cross attention logic for VIVIT, we replace "class labels" in the zip dataset with VIVIT embeddings
-            we will pass "class_labels" (which are now VIVIT embeddings) as context to the cross attention layers in each block.
-        '''
+        # FiLM path: pool VIVIT embeddings to single vector, project into noise embedding space.
+        # Cross-attention path: pass full embeddings as context to blocks at attn_resolutions.
         emb = self.emb_noise(self.emb_fourier(noise_labels))
-        # if self.emb_label is not None:
-            # emb = mp_sum(emb, self.emb_label(class_labels * np.sqrt(class_labels.shape[1])), t=self.label_balance)
+        if self.emb_label is not None:
+            pooled = class_labels.mean(dim=1)  # (B, T, D) → (B, D)
+            emb = mp_sum(emb, self.emb_label(pooled * np.sqrt(pooled.shape[1])), t=self.label_balance)
         emb = mp_silu(emb)
 
         # Encoder.
@@ -391,9 +394,10 @@ class Precond(torch.nn.Module):
         super().__init__()
         self.img_resolution = img_resolution
         self.img_channels = img_channels
-        self.label_dim = label_dim #label_dim is now VIVIT embedding dimensionality, not class label dimensionality
+        self.label_dim = label_dim  # VIVIT embedding dimensionality
         self.use_fp16 = use_fp16
         self.sigma_data = sigma_data
+        self.emb_label_norm = torch.nn.LayerNorm(label_dim)  # normalize raw embeddings for EDM2 unit-variance
         self.unet = UNet(img_resolution=img_resolution, img_channels=img_channels, label_dim=label_dim, **unet_kwargs)
         self.logvar_fourier = MPFourier(logvar_channels)
         self.logvar_linear = MPConv(logvar_channels, 1, kernel=[])
@@ -402,12 +406,13 @@ class Precond(torch.nn.Module):
         x = x.to(torch.float32)
         sigma = sigma.to(torch.float32).reshape(-1, 1, 1, 1)
         
-        # class_labels = None if self.label_dim == 0 else torch.zeros([1, self.label_dim], device=x.device) if class_labels is None else class_labels.to(torch.float32).reshape(-1, self.label_dim)
-
-        #NOTE: this will error if embeddings aren't passed
-        #assert class_labels (context) has a sequence dimension (B, T, D) for cross attention
-        assert class_labels is not None and class_labels.ndim == 3, "class_labels (context) must be a 3D tensor (Batch, Sequence, Dim)"
-        class_labels = class_labels.to(torch.float32) #pass through as is
+        # VIVIT embeddings: ensure 3D shape (B, T, D) for cross-attention
+        assert class_labels is not None, "class_labels (VIVIT embeddings) must be provided"
+        class_labels = class_labels.to(torch.float32)
+        if class_labels.ndim == 2:
+            class_labels = class_labels.unsqueeze(1)  # (B, D) → (B, 1, D)
+        assert class_labels.ndim == 3, "class_labels must be 2D (B, D) or 3D (B, T, D)"
+        class_labels = self.emb_label_norm(class_labels)  # normalize embeddings for EDM2 unit-variance
         
         dtype = torch.float16 if (self.use_fp16 and not force_fp32 and x.device.type == 'cuda') else torch.float32
 
