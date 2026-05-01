@@ -20,6 +20,13 @@ import PIL.Image
 import dnnlib
 from torch_utils import distributed as dist
 
+from scipy.ndimage import zoom as scipy_zoom
+
+try:
+    import nibabel as nib
+except ImportError:
+    nib = None
+
 warnings.filterwarnings('ignore', '`resume_download` is deprecated')
 warnings.filterwarnings('ignore', 'You are using `torch.load` with `weights_only=False`')
 warnings.filterwarnings('ignore', '1Torch was not compiled with flash attention')
@@ -81,10 +88,11 @@ def edm_sampler(
 ):
     # Guided denoiser.
     def denoise(x, t):
-        Dx = net(x, t, labels).to(dtype)
+        _labels = labels.to(torch.float32) if labels is not None else None
+        Dx = net(x, t, _labels).to(dtype)
         if guidance == 1:
             return Dx
-        ref_Dx = gnet(x, t, labels).to(dtype)
+        ref_Dx = gnet(x, t, _labels).to(dtype)
         return ref_Dx.lerp(Dx, guidance)
 
     # Time step discretization.
@@ -143,13 +151,14 @@ class StackedRandomGenerator:
 # dnnlib.EasyDict(images, labels, noise, batch_idx, num_batches, indices, seeds)
 
 def load_embedding_csv(path):
-    """Load a VIVIT embedding from a CSV file. Returns the first row as (1, 1, D) tensor."""
+    """Load a VIVIT embedding from a CSV file. Returns all rows as (1, T, D) tensor."""
+    rows = []
     with open(path) as f:
         reader = csv.reader(f)
         next(reader)  # skip header
-        first_row = next(reader)
-        embedding = [float(x) for x in first_row[1:]]  # skip index column
-    return torch.tensor(embedding, dtype=torch.float32).reshape(1, 1, -1)  # (1, 1, D)
+        for row in reader:
+            rows.append([float(x) for x in row[1:]])  # skip index column
+    return torch.tensor(rows, dtype=torch.float32).unsqueeze(0)  # (1, T, D)
 
 def generate_images(
     net,                                        # Main network. Path, URL, or torch.nn.Module.
@@ -160,6 +169,7 @@ def generate_images(
     seeds               = range(16, 24),        # List of random seeds.
     class_idx           = None,                 # Class label. None = select randomly.
     embeddings          = None,                 # Path to VIVIT embedding CSV file. None = use class labels.
+    original_shape      = None,                 # Original (D,H,W) to rescale 3D outputs. None = no rescaling.
     max_batch_size      = 32,                   # Maximum batch size for the diffusion model.
     encoder_batch_size  = 4,                    # Maximum batch size for the encoder. None = default.
     verbose             = True,                 # Enable status prints?
@@ -178,6 +188,11 @@ def generate_images(
         with dnnlib.util.open_url(net, verbose=(verbose and dist.get_rank() == 0)) as f:
             data = pickle.load(f)
         net = data['ema'].to(device)
+        # Old pkl checkpoints cast class_labels to fp16 before emb_label_norm; wrap to match weight dtype.
+        if hasattr(net, 'emb_label_norm'):
+            _orig_norm_fwd = net.emb_label_norm.forward
+            _norm = net.emb_label_norm
+            net.emb_label_norm.forward = lambda x: _orig_norm_fwd(x.to(_norm.weight.dtype if _norm.weight is not None else x.dtype)).to(x.dtype)
         if encoder is None:
             encoder = data.get('encoder', None)
             if encoder is None:
@@ -225,12 +240,16 @@ def generate_images(
 
                     # Pick noise and labels.
                     rnd = StackedRandomGenerator(device, r.seeds)
-                    r.noise = rnd.randn([len(r.seeds), net.img_channels, net.img_resolution, net.img_resolution], device=device)
+                    is_3d = hasattr(net, 'unet') and net.unet.out_conv.weight.ndim == 5
+                    if is_3d:
+                        r.noise = rnd.randn([len(r.seeds), net.img_channels, net.img_resolution, net.img_resolution, net.img_resolution], device=device)
+                    else:
+                        r.noise = rnd.randn([len(r.seeds), net.img_channels, net.img_resolution, net.img_resolution], device=device)
                     r.labels = None
                     if embeddings is not None:
                         # Load VIVIT embedding from CSV and broadcast to batch size
-                        emb = load_embedding_csv(embeddings).to(device)  # (1, 1, D)
-                        r.labels = emb.expand(len(r.seeds), -1, -1)  # (B, 1, D)
+                        emb = load_embedding_csv(embeddings).to(device)  # (1, T, D)
+                        r.labels = emb.expand(len(r.seeds), -1, -1)  # (B, T, D)
                     elif net.label_dim > 0:
                         r.labels = torch.eye(net.label_dim, device=device)[rnd.randint(net.label_dim, size=[len(r.seeds)], device=device)]
                         if class_idx is not None:
@@ -244,10 +263,27 @@ def generate_images(
 
                     # Save images.
                     if outdir is not None:
-                        for seed, image in zip(r.seeds, r.images.permute(0, 2, 3, 1).cpu().numpy()):
-                            image_dir = os.path.join(outdir, f'{seed//1000*1000:06d}') if subdirs else outdir
-                            os.makedirs(image_dir, exist_ok=True)
-                            PIL.Image.fromarray(image, 'RGB').save(os.path.join(image_dir, f'{seed:06d}.png'))
+                        if is_3d:
+                            # Save as NIfTI volumes
+                            assert nib is not None, "nibabel is required for saving 3D volumes"
+                            for seed, vol in zip(r.seeds, r.images.cpu().numpy()):
+                                vol_dir = os.path.join(outdir, f'{seed//1000*1000:06d}') if subdirs else outdir
+                                os.makedirs(vol_dir, exist_ok=True)
+                                # vol shape: (C, D, H, W) — take first channel
+                                vol_data = vol[0].astype(np.uint8)
+                                # Rescale to original resolution if specified
+                                if original_shape is not None:
+                                    target = tuple(original_shape)
+                                    if vol_data.shape != target:
+                                        scale = tuple(t / s for t, s in zip(target, vol_data.shape))
+                                        vol_data = scipy_zoom(vol_data, scale, order=0)
+                                nii = nib.Nifti1Image(vol_data, affine=np.eye(4))
+                                nib.save(nii, os.path.join(vol_dir, f'{seed:06d}.nii.gz'))
+                        else:
+                            for seed, image in zip(r.seeds, r.images.permute(0, 2, 3, 1).cpu().numpy()):
+                                image_dir = os.path.join(outdir, f'{seed//1000*1000:06d}') if subdirs else outdir
+                                os.makedirs(image_dir, exist_ok=True)
+                                PIL.Image.fromarray(image, 'RGB').save(os.path.join(image_dir, f'{seed:06d}.png'))
 
                 # Yield results.
                 torch.distributed.barrier() # keep the ranks in sync
@@ -284,6 +320,7 @@ def parse_int_list(s):
 @click.option('--seeds',                    help='List of random seeds (e.g. 1,2,5-10)', metavar='LIST',            type=parse_int_list, default='16-19', show_default=True)
 @click.option('--class', 'class_idx',       help='Class label  [default: random]', metavar='INT',                   type=click.IntRange(min=0), default=None)
 @click.option('--embeddings',               help='Path to VIVIT embedding CSV file for conditioning', metavar='PATH', type=str, default=None)
+@click.option('--original-shape',           help='Original D,H,W to rescale 3D output (e.g. 394,466,378)', metavar='D,H,W', type=str, default=None)
 @click.option('--batch', 'max_batch_size',  help='Maximum batch size', metavar='INT',                               type=click.IntRange(min=1), default=32, show_default=True)
 
 @click.option('--steps', 'num_steps',       help='Number of sampling steps', metavar='INT',                         type=click.IntRange(min=1), default=32, show_default=True)
@@ -328,6 +365,10 @@ def cmdline(preset, **opts):
         opts.gnet = None
     elif opts.gnet is None:
         raise click.ClickException('Please specify --gnet when using guidance')
+
+    # Parse original_shape from string to tuple of ints.
+    if opts.original_shape is not None:
+        opts.original_shape = tuple(int(x) for x in opts.original_shape.split(','))
 
     # Generate.
     dist.init()

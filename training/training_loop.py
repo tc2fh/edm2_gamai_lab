@@ -32,7 +32,7 @@ class EDM2Loss:
         self.sigma_data = sigma_data
 
     def __call__(self, net, images, labels=None):
-        rnd_normal = torch.randn([images.shape[0], 1, 1, 1], device=images.device)
+        rnd_normal = torch.randn([images.shape[0]] + [1] * (images.ndim - 1), device=images.device)
         sigma = (rnd_normal * self.P_std + self.P_mean).exp()
         weight = (sigma ** 2 + self.sigma_data ** 2) / (sigma * self.sigma_data) ** 2
         noise = torch.randn_like(images) * sigma
@@ -114,10 +114,11 @@ def training_loop(
 
     # Print network summary.
     if dist.get_rank() == 0:
+        label_tokens = ref_label.shape[0] if ref_label.ndim >= 2 else 1
         misc.print_module_summary(net, [
-            torch.zeros([batch_gpu, net.img_channels, net.img_resolution, net.img_resolution], device=device),
+            torch.zeros([batch_gpu, net.img_channels, net.img_resolution, net.img_resolution, net.img_resolution], device=device),
             torch.ones([batch_gpu], device=device),
-            torch.zeros([batch_gpu, 1, net.label_dim], device=device),
+            torch.zeros([batch_gpu, label_tokens, net.label_dim], device=device),
         ], max_nesting=2)
 
     # Setup training state.

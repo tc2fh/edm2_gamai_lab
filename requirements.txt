@@ -1,0 +1,15 @@
+torch
+torchvision
+numpy
+click
+pillow
+psutil
+requests
+scipy
+tqdm
+einops
+tensorboard
+nibabel
+diffusers==0.26.3
+accelerate==0.27.2
+torchdyn

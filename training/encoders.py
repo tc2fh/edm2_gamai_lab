@@ -73,6 +73,24 @@ class StandardRGBEncoder(Encoder):
         return (x.to(torch.float32) * 127.5 + 128).clip(0, 255).to(torch.uint8)
 
 #----------------------------------------------------------------------------
+# Binary mask encoder for 3D segmentation volumes.
+# Maps {0,1} uint8 masks to {-1,+1} float32 for training, thresholds on decode.
+
+@persistence.persistent_class
+class BinaryMask3DEncoder(Encoder):
+    def __init__(self):
+        super().__init__()
+
+    def encode_pixels(self, x):  # raw pixels => raw latents (identity)
+        return x
+
+    def encode_latents(self, x):  # raw latents => final latents: {0,1} → {-1,+1}
+        return x.to(torch.float32) * 2.0 - 1.0
+
+    def decode(self, x):  # final latents => raw pixels: threshold at 0
+        return (x.to(torch.float32) > 0).to(torch.uint8)
+
+#----------------------------------------------------------------------------
 # Pre-trained VAE encoder from Stability AI.
 
 @persistence.persistent_class

@@ -35,6 +35,11 @@ config_presets = {
     'edm2-img64-m':     dnnlib.EasyDict(duration=2048<<20, batch=2048, channels=256, lr=0.0090, decay=35000, dropout=0.10, P_mean=-0.8, P_std=1.6),
     'edm2-img64-l':     dnnlib.EasyDict(duration=1024<<20, batch=2048, channels=320, lr=0.0080, decay=35000, dropout=0.10, P_mean=-0.8, P_std=1.6),
     'edm2-img64-xl':    dnnlib.EasyDict(duration=640<<20,  batch=2048, channels=384, lr=0.0070, decay=35000, dropout=0.10, P_mean=-0.8, P_std=1.6),
+
+    # 3D volume presets (128^3 binary segmentation masks)
+    'edm2-vol128-xxs':  dnnlib.EasyDict(duration=256<<20, batch=8,  channels=32,  channel_mult=[1,2,4,8], lr=0.0100, decay=35000, dropout=0.00, P_mean=-0.4, P_std=1.0),
+    'edm2-vol128-xs':   dnnlib.EasyDict(duration=256<<20, batch=8,  channels=48,  channel_mult=[1,2,4,8], lr=0.0100, decay=35000, dropout=0.00, P_mean=-0.4, P_std=1.0),
+    'edm2-vol128-s':    dnnlib.EasyDict(duration=256<<20, batch=4,  channels=64,  channel_mult=[1,2,4,8], lr=0.0100, decay=35000, dropout=0.00, P_mean=-0.4, P_std=1.0),
 }
 
 #----------------------------------------------------------------------------
@@ -63,7 +68,9 @@ def setup_training_config(preset='edm2-img512-s', **opts):
         raise click.ClickException(f'--data: {err}')
 
     # Encoder.
-    if dataset_channels == 3:
+    if dataset_channels == 1:
+        c.encoder_kwargs = dnnlib.EasyDict(class_name='training.encoders.BinaryMask3DEncoder')
+    elif dataset_channels == 3:
         c.encoder_kwargs = dnnlib.EasyDict(class_name='training.encoders.StandardRGBEncoder')
     elif dataset_channels == 8:
         c.encoder_kwargs = dnnlib.EasyDict(class_name='training.encoders.StabilityVAEEncoder')
@@ -73,6 +80,8 @@ def setup_training_config(preset='edm2-img512-s', **opts):
     # Hyperparameters.
     c.update(total_nimg=opts.duration, batch_size=opts.batch)
     c.network_kwargs = dnnlib.EasyDict(class_name='training.networks_edm2.Precond', model_channels=opts.channels, dropout=opts.dropout)
+    if opts.get('channel_mult', None) is not None:
+        c.network_kwargs.channel_mult = opts.channel_mult
     c.loss_kwargs = dnnlib.EasyDict(class_name='training.training_loop.EDM2Loss', P_mean=opts.P_mean, P_std=opts.P_std)
     c.lr_kwargs = dnnlib.EasyDict(func_name='training.training_loop.learning_rate_schedule', ref_lr=opts.lr, ref_batches=opts.decay)
 
@@ -150,7 +159,7 @@ def parse_nimg(s):
 # Hyperparameters.
 @click.option('--duration',         help='Training duration', metavar='NIMG',                   type=parse_nimg, default=None)
 @click.option('--batch',            help='Total batch size', metavar='NIMG',                    type=parse_nimg, default=None)
-@click.option('--channels',         help='Channel multiplier', metavar='INT',                   type=click.IntRange(min=64), default=None)
+@click.option('--channels',         help='Channel multiplier', metavar='INT',                   type=click.IntRange(min=16), default=None)
 @click.option('--dropout',          help='Dropout probability', metavar='FLOAT',                type=click.FloatRange(min=0, max=1), default=None)
 @click.option('--P_mean', 'P_mean', help='Noise level mean', metavar='FLOAT',                   type=float, default=None)
 @click.option('--P_std', 'P_std',   help='Noise level standard deviation', metavar='FLOAT',     type=click.FloatRange(min=0, min_open=True), default=None)

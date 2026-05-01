@@ -97,8 +97,8 @@ class Dataset(torch.utils.data.Dataset):
         assert isinstance(image, np.ndarray)
         assert list(image.shape) == self._raw_shape[1:]
         if self._xflip[idx]:
-            assert image.ndim == 3 # CHW
-            image = image[:, :, ::-1]
+            assert image.ndim in [3, 4]  # CHW or CDHW
+            image = image[..., ::-1]  # flip last spatial dim
         return image.copy(), self.get_label(idx)
 
     def get_label(self, idx):
@@ -126,12 +126,15 @@ class Dataset(torch.utils.data.Dataset):
 
     @property
     def num_channels(self):
-        assert len(self.image_shape) == 3 # CHW
+        assert len(self.image_shape) in [3, 4]  # CHW or CDHW
         return self.image_shape[0]
 
     @property
     def resolution(self):
-        assert len(self.image_shape) == 3 # CHW
+        assert len(self.image_shape) in [3, 4]  # CHW or CDHW
+        if len(self.image_shape) == 4:  # CDHW
+            assert self.image_shape[1] == self.image_shape[2] == self.image_shape[3]
+            return self.image_shape[1]
         assert self.image_shape[1] == self.image_shape[2]
         return self.image_shape[1]
 
@@ -147,8 +150,7 @@ class Dataset(torch.utils.data.Dataset):
 
     @property
     def label_dim(self):
-        assert len(self.label_shape) == 1
-        return self.label_shape[0]
+        return self.label_shape[-1]
 
     @property
     def has_labels(self):
@@ -182,14 +184,18 @@ class ImageFolderDataset(Dataset):
 
         PIL.Image.init()
         supported_ext = PIL.Image.EXTENSION.keys() | {'.npy'}
-        self._image_fnames = sorted(fname for fname in self._all_fnames if self._file_ext(fname) in supported_ext)
+        self._image_fnames = sorted(fname for fname in self._all_fnames if self._file_ext(fname) in supported_ext and os.path.basename(fname) != 'embeddings.npy')
         if len(self._image_fnames) == 0:
             raise IOError('No image files found in the specified path')
 
         name = os.path.splitext(os.path.basename(self._path))[0]
         raw_shape = [len(self._image_fnames)] + list(self._load_raw_image(0).shape)
-        if resolution is not None and (raw_shape[2] != resolution or raw_shape[3] != resolution):
-            raise IOError('Image files do not match the specified resolution')
+        if resolution is not None:
+            if len(raw_shape) == 5:  # NCDHW
+                if raw_shape[2] != resolution or raw_shape[3] != resolution or raw_shape[4] != resolution:
+                    raise IOError('Volume files do not match the specified resolution')
+            elif raw_shape[2] != resolution or raw_shape[3] != resolution:
+                raise IOError('Image files do not match the specified resolution')
         super().__init__(name=name, raw_shape=raw_shape, **super_kwargs)
 
     @staticmethod
@@ -225,7 +231,17 @@ class ImageFolderDataset(Dataset):
         with self._open_file(fname) as f:
             if ext == '.npy':
                 image = np.load(f)
-                image = image.reshape(-1, *image.shape[-2:])
+                if image.ndim == 3:
+                    # Could be DHW (3D volume) or HWC (2D image)
+                    # If first dim is small (<=4), treat as CHW; otherwise treat as DHW volume
+                    if image.shape[0] <= 4:
+                        pass  # already CHW
+                    else:
+                        image = image[np.newaxis, :, :, :]  # DHW -> CDHW
+                elif image.ndim == 4:
+                    pass  # already CDHW
+                else:
+                    image = image.reshape(-1, *image.shape[-2:])
             elif ext == '.png' and pyspng is not None:
                 image = pyspng.load(f.read())
                 image = image.reshape(*image.shape[:2], -1).transpose(2, 0, 1)
@@ -242,6 +258,21 @@ class ImageFolderDataset(Dataset):
             labels = json.load(f)['labels']
         if labels is None:
             return None
+
+        # Check for embeddings.npy (pre-computed VIVIT embeddings)
+        if 'embeddings.npy' in self._all_fnames:
+            with self._open_file('embeddings.npy') as f:
+                all_embeddings = np.load(f)  # (N, T, D) e.g. (N, 256, 768)
+
+            # labels entries are [filename, index] pairs — use index to reorder
+            labels_dict = dict(labels)
+            ordered_embeddings = np.stack([
+                all_embeddings[int(labels_dict[fname.replace('\\', '/')])]
+                for fname in self._image_fnames
+            ])
+            return ordered_embeddings.astype(np.float32)
+
+        # Fallback: standard label behavior
         labels = dict(labels)
         labels = [labels[fname.replace('\\', '/')] for fname in self._image_fnames]
         labels = np.array(labels)

@@ -33,20 +33,17 @@ class CrossAttention(torch.nn.Module):
         self.scale = dim_head ** -0.5
         self.heads = heads
 
-        self.to_q = torch.nn.Linear(query_dim, inner_dim, bias=False)
-        self.to_k = torch.nn.Linear(context_dim, inner_dim, bias=False)
-        self.to_v = torch.nn.Linear(context_dim, inner_dim, bias=False)
-
-        self.to_out = torch.nn.Sequential(
-            torch.nn.Linear(inner_dim, query_dim),
-            torch.nn.Dropout(dropout)
-        )
+        self.to_q = MPConv(query_dim, inner_dim, kernel=[])
+        self.to_k = MPConv(context_dim, inner_dim, kernel=[])
+        self.to_v = MPConv(context_dim, inner_dim, kernel=[])
+        self.to_out = MPConv(inner_dim, query_dim, kernel=[])
+        self.dropout = dropout
 
     def forward(self, x, context=None, mask=None):
         h = self.heads
 
         q = self.to_q(x)
-        context = default(context, x)
+        context = default(context, x).to(x.dtype)
         k = self.to_k(context)
         v = self.to_v(context)
 
@@ -60,12 +57,14 @@ class CrossAttention(torch.nn.Module):
             mask = repeat(mask, 'b j -> (b h) () j', h=h)
             sim.masked_fill_(~mask, max_neg_value)
 
-        # attention, what we cannot get enough of
         attn = sim.softmax(dim=-1)
 
         out = torch.einsum('b i j, b j d -> b i d', attn, v)
         out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
-        return self.to_out(out)
+        out = self.to_out(out)
+        if self.training and self.dropout > 0:
+            out = torch.nn.functional.dropout(out, p=self.dropout)
+        return out
     
 #----------------------------------------------------------------------------
 # Normalize given tensor to unit magnitude with respect to the given
@@ -89,13 +88,23 @@ def resample(x, f=[1,1], mode='keep'):
     assert f.ndim == 1 and len(f) % 2 == 0
     pad = (len(f) - 1) // 2
     f = f / f.sum()
-    f = np.outer(f, f)[np.newaxis, np.newaxis, :, :]
+    is_3d = (x.ndim == 5)
+    if is_3d:
+        f = np.einsum('i,j,k->ijk', f, f, f)[np.newaxis, np.newaxis, :, :, :]
+    else:
+        f = np.outer(f, f)[np.newaxis, np.newaxis, :, :]
     f = misc.const_like(x, f)
     c = x.shape[1]
-    if mode == 'down':
-        return torch.nn.functional.conv2d(x, f.tile([c, 1, 1, 1]), groups=c, stride=2, padding=(pad,))
-    assert mode == 'up'
-    return torch.nn.functional.conv_transpose2d(x, (f * 4).tile([c, 1, 1, 1]), groups=c, stride=2, padding=(pad,))
+    if is_3d:
+        if mode == 'down':
+            return torch.nn.functional.conv3d(x, f.tile([c, 1, 1, 1, 1]), groups=c, stride=2, padding=(pad,))
+        assert mode == 'up'
+        return torch.nn.functional.conv_transpose3d(x, (f * 8).tile([c, 1, 1, 1, 1]), groups=c, stride=2, padding=(pad,))
+    else:
+        if mode == 'down':
+            return torch.nn.functional.conv2d(x, f.tile([c, 1, 1, 1]), groups=c, stride=2, padding=(pad,))
+        assert mode == 'up'
+        return torch.nn.functional.conv_transpose2d(x, (f * 4).tile([c, 1, 1, 1]), groups=c, stride=2, padding=(pad,))
 
 #----------------------------------------------------------------------------
 # Magnitude-preserving SiLU (Equation 81).
@@ -158,7 +167,9 @@ class MPConv(torch.nn.Module):
         w = w.to(x.dtype)
         if w.ndim == 2:
             return x @ w.t()
-        assert w.ndim == 4
+        assert w.ndim in [4, 5]
+        if w.ndim == 5:
+            return torch.nn.functional.conv3d(x, w, padding=(w.shape[-1]//2,)*3)
         return torch.nn.functional.conv2d(x, w, padding=(w.shape[-1]//2,))
 
 #----------------------------------------------------------------------------
@@ -195,12 +206,12 @@ class Block(torch.nn.Module):
         self.cross_attn_balance = cross_attn_balance #torch.nn.Parameter(torch.tensor(cross_attn_balance)) consider making this a learnable parameter
         self.clip_act = clip_act
         self.emb_gain = torch.nn.Parameter(torch.zeros([]))
-        self.conv_res0 = MPConv(out_channels if flavor == 'enc' else in_channels, out_channels, kernel=[3,3])
+        self.conv_res0 = MPConv(out_channels if flavor == 'enc' else in_channels, out_channels, kernel=[3,3,3])
         self.emb_linear = MPConv(emb_channels, out_channels, kernel=[])
-        self.conv_res1 = MPConv(out_channels, out_channels, kernel=[3,3])
-        self.conv_skip = MPConv(in_channels, out_channels, kernel=[1,1]) if in_channels != out_channels else None
-        self.attn_qkv = MPConv(out_channels, out_channels * 3, kernel=[1,1]) if self.num_heads != 0 else None
-        self.attn_proj = MPConv(out_channels, out_channels, kernel=[1,1]) if self.num_heads != 0 else None
+        self.conv_res1 = MPConv(out_channels, out_channels, kernel=[3,3,3])
+        self.conv_skip = MPConv(in_channels, out_channels, kernel=[1,1,1]) if in_channels != out_channels else None
+        self.attn_qkv = MPConv(out_channels, out_channels * 3, kernel=[1,1,1]) if self.num_heads != 0 else None
+        self.attn_proj = MPConv(out_channels, out_channels, kernel=[1,1,1]) if self.num_heads != 0 else None
 
         # Cross-attention layers for VIVIT. **new**
         self.cross_attn = None
@@ -223,7 +234,7 @@ class Block(torch.nn.Module):
         # Residual branch.
         y = self.conv_res0(mp_silu(x))
         c = self.emb_linear(emb, gain=self.emb_gain) + 1
-        y = mp_silu(y * c.unsqueeze(2).unsqueeze(3).to(y.dtype))
+        y = mp_silu(y * c.unsqueeze(2).unsqueeze(3).unsqueeze(4).to(y.dtype))
         if self.training and self.dropout != 0:
             y = torch.nn.functional.dropout(y, p=self.dropout)
         y = self.conv_res1(y)
@@ -238,7 +249,7 @@ class Block(torch.nn.Module):
         # but we haven't done sufficient testing to verify that it produces identical results.
         if self.num_heads != 0:
             y = self.attn_qkv(x)
-            y = y.reshape(y.shape[0], self.num_heads, -1, 3, y.shape[2] * y.shape[3])
+            y = y.reshape(y.shape[0], self.num_heads, -1, 3, int(np.prod(y.shape[2:])))
             q, k, v = normalize(y, dim=2).unbind(3) # pixel norm & split
             w = torch.einsum('nhcq,nhck->nhqk', q, k / np.sqrt(q.shape[2])).softmax(dim=3)
             y = torch.einsum('nhqk,nhck->nhcq', w, v)
@@ -253,17 +264,17 @@ class Block(torch.nn.Module):
         https://github.com/CompVis/latent-diffusion/tree/main
         '''
         if self.cross_attn is not None and context is not None:
-            # Reshape x from (B, C, H, W) to (B, H*W, C) for the Linear Attention
-            b, c, h, w = x.shape
-            spatial_x = rearrange(x, 'b c h w -> b (h w) c')
-            
+            # Reshape x from (B, C, D, H, W) to (B, D*H*W, C) for the Linear Attention
+            b, c, d, h, w = x.shape
+            spatial_x = rearrange(x, 'b c d h w -> b (d h w) c')
+
             # Apply Cross Attention
-            # x is Query (B, HW, C)
+            # x is Query (B, DHW, C)
             # context is Key/Value (B, T, D) (VIVIT Embeddings)
             attn_out = self.cross_attn(spatial_x, context=context)
-            
-            # Reshape back to (B, C, H, W)
-            attn_out = rearrange(attn_out, 'b (h w) c -> b c h w', h=h, w=w)
+
+            # Reshape back to (B, C, D, H, W)
+            attn_out = rearrange(attn_out, 'b (d h w) c -> b c d h w', d=d, h=h, w=w)
             
             # EDM2 Integration
             # Standard Linear layers do not preserve unit variance. 
@@ -321,7 +332,7 @@ class UNet(torch.nn.Module):
             if level == 0:
                 cin = cout
                 cout = channels
-                self.enc[f'{res}x{res}_conv'] = MPConv(cin, cout, kernel=[3,3])
+                self.enc[f'{res}x{res}_conv'] = MPConv(cin, cout, kernel=[3,3,3])
             else:
                 self.enc[f'{res}x{res}_down'] = Block(cout, cout, cemb, flavor='enc', resample_mode='down', context_dim=use_ctx, **block_kwargs)
             for idx in range(num_blocks):
@@ -344,7 +355,7 @@ class UNet(torch.nn.Module):
                 cin = cout + skips.pop()
                 cout = channels
                 self.dec[f'{res}x{res}_block{idx}'] = Block(cin, cout, cemb, flavor='dec', attention=(res in attn_resolutions), context_dim=use_ctx, **block_kwargs)
-        self.out_conv = MPConv(cout, img_channels, kernel=[3,3])
+        self.out_conv = MPConv(cout, img_channels, kernel=[3,3,3])
 
     def forward(self, x, noise_labels, class_labels):
         # Embedding.
@@ -404,7 +415,7 @@ class Precond(torch.nn.Module):
 
     def forward(self, x, sigma, class_labels=None, force_fp32=False, return_logvar=False, **unet_kwargs):
         x = x.to(torch.float32)
-        sigma = sigma.to(torch.float32).reshape(-1, 1, 1, 1)
+        sigma = sigma.to(torch.float32).reshape(-1, 1, 1, 1, 1)
         
         # VIVIT embeddings: ensure 3D shape (B, T, D) for cross-attention
         assert class_labels is not None, "class_labels (VIVIT embeddings) must be provided"
@@ -412,9 +423,10 @@ class Precond(torch.nn.Module):
         if class_labels.ndim == 2:
             class_labels = class_labels.unsqueeze(1)  # (B, D) → (B, 1, D)
         assert class_labels.ndim == 3, "class_labels must be 2D (B, D) or 3D (B, T, D)"
-        class_labels = self.emb_label_norm(class_labels)  # normalize embeddings for EDM2 unit-variance
-        
+        class_labels = self.emb_label_norm(class_labels)  # normalize in fp32 for stability
+
         dtype = torch.float16 if (self.use_fp16 and not force_fp32 and x.device.type == 'cuda') else torch.float32
+        class_labels = class_labels.to(dtype)  # cast after norm to match UNet dtype
 
         # Preconditioning weights.
         c_skip = self.sigma_data ** 2 / (sigma ** 2 + self.sigma_data ** 2)
@@ -429,7 +441,7 @@ class Precond(torch.nn.Module):
 
         # Estimate uncertainty if requested.
         if return_logvar:
-            logvar = self.logvar_linear(self.logvar_fourier(c_noise)).reshape(-1, 1, 1, 1)
+            logvar = self.logvar_linear(self.logvar_fourier(c_noise)).reshape(-1, 1, 1, 1, 1)
             return D_x, logvar # u(sigma) in Equation 21
         return D_x
 

@@ -1,0 +1,26 @@
+[workspace]
+channels = ["conda-forge"]
+name = "gam_ai"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+python = "3.13.*"
+tensorboard = ">=2.20.0,<3"
+einops = ">=0.8.2,<0.9"
+
+[pypi-dependencies]
+click = ">=8.3.1, <9"
+pillow = ">=12.1.1, <13"
+psutil = ">=7.2.2, <8"
+requests = ">=2.32.5, <3"
+scipy = ">=1.17.1, <2"
+tqdm = ">=4.67.3, <5"
+diffusers = "==0.26.3"
+accelerate = "==0.27.2"
+torch = { version = "*", index = "https://download.pytorch.org/whl/cu130" }
+torchvision = { version = "*", index = "https://download.pytorch.org/whl/cu130" }
+torchdyn = ">=1.0.6, <2"
+nibabel = ">=5.0.0, <6"
