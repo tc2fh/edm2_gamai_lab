@@ -43,3 +43,12 @@ rivanna_dl/
 # pixi environments
 .pixi/*
 !.pixi/config.toml
+
+# Local pair datasets, training runs, generated forecasts
+datasets/
+runs/
+
+# Large generated deliverables and renders (rebuild with tools/build_flow_deck.sh)
+analysis/**/*.pptx
+analysis/**/panels/
+*.gif

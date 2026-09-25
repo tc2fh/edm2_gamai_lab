@@ -111,7 +111,10 @@ class CheckpointIO:
     def load(self, pt_path, verbose=True):
         if verbose:
             print0(f'Loading {pt_path} ... ', end='', flush=True)
-        data = torch.load(pt_path, map_location=torch.device('cpu'))
+        # weights_only=False: these are our own trusted training-state checkpoints, which
+        # contain dnnlib.util.EasyDict and other non-tensor objects that torch's default
+        # (weights_only=True since torch 2.6) restricted unpickler rejects.
+        data = torch.load(pt_path, map_location=torch.device('cpu'), weights_only=False)
         for name, obj in self._state_objs.items():
             if obj is None:
                 pass

@@ -1,233 +1,258 @@
-## EDM2 and Autoguidance &mdash; Official PyTorch implementation
+## EDM2 fork: ViViT-conditioned 3D diffusion forecasting of vestibular-schwannoma masks
 
-![Teaser image](./docs/teaser-2048x512.jpg)
+Fork of NVIDIA's EDM2 and Autoguidance reference implementation (citation and
+license at the bottom of this file). Upstream trained 2D image diffusion
+models on ImageNet; this fork trains a 3D diffusion model that forecasts a
+patient's *future* tumor mask from their *current* mask, the time gap to the
+target scan, and spatial ViT tokens from a frozen ViViT encoder trained
+elsewhere in the lab. There is no 2D path left, no ImageNet dataset tooling,
+and no image (pixel) synthesis: the target is always a binary or signed-
+distance mask volume.
 
-**Analyzing and Improving the Training Dynamics of Diffusion Models** (CVPR 2024 oral)<br>
-Tero Karras, Miika Aittala, Jaakko Lehtinen, Janne Hellsten, Timo Aila, Samuli Laine<br>
-https://arxiv.org/abs/2312.02696<br>
+The plan and the exact data/API contracts this code implements live in
+`docs/vivit_conditioning_plan.md` and `docs/vivit_pipeline_contracts.md`.
+Read those before changing conditioning, encodings, or the batch dict shape;
+this README only describes how to run what is already implemented.
 
-**Guiding a Diffusion Model with a Bad Version of Itself** (NeurIPS 2024 oral)<br>
-Tero Karras, Miika Aittala, Tuomas Kynk&auml;&auml;nniemi, Jaakko Lehtinen, Timo Aila, Samuli Laine<br>
-https://arxiv.org/abs/2406.02507<br>
+## Environment
 
-For business inquiries, please visit our website and submit the form: [NVIDIA Research Licensing](https://www.nvidia.com/en-us/research/inquiries/)
+- This repo (dataset prep, training, generation, evaluation, checkpoint
+  selection) is run with the ViViT repo's pixi interpreter, which has the
+  matching torch/CUDA build and the packages the token store and encoder
+  code need:
+  `D:/Work/GrowthNet_gamailab/GrowthNet/projects/vivit/tien_rivanna_repo/.pixi/envs/default/python.exe`
+  (Python 3.12, torch 2.11.0+cu130, monai, einops, nibabel, scipy, sklearn).
+  Do not use a bare `python`/`python3` on Windows; it may resolve to the
+  Microsoft Store stub.
+- Training runs single-GPU on a local RTX 5090, no Slurm, no `torchrun`
+  (see "What changed from upstream" below).
+- Phase 5 (comparison against FlowMatchingGrowthNet) scores forecasts with
+  the flow repo's own metrics code and deck builder, so those specific steps
+  run under the flow repo's `uv` environment instead:
+  `uv run --project D:/Work/GrowthNet_gamailab/FlowMatchingGrowthNet python ...`
 
-## Requirements
+## Pipeline overview
 
-* Linux and Windows are supported, but we recommend Linux for performance and compatibility reasons.
-* 1+ high-end NVIDIA GPU for sampling and 8+ GPUs for training. We have done all testing and development using V100 and A100 GPUs.
-* 64-bit Python 3.9 and PyTorch 2.1 (or later). See https://pytorch.org for PyTorch install instructions.
-* Other Python libraries: `pip install click Pillow psutil requests scipy tqdm diffusers==0.26.3 accelerate==0.27.2`
-* For downloading the raw snapshots needed for post-hoc EMA reconstruction, we recommend using [Rclone](https://rclone.org/install/).
+The pipeline has six steps, each documented below in order: token store,
+pair dataset, training, checkpoint selection, generation (with knockouts),
+evaluation, and (Phase 5 only) a comparison deck against the flow repo. Set
+`PY` once for convenience:
 
-For convenience, we provide a [Dockerfile](./Dockerfile) with the required dependencies. You can use it as follows:
-
-```.bash
-# Build Docker image
-docker build --tag edm2:latest .
-
-# Run generate_images.py using Docker
-docker run --gpus all -it --rm --user $(id -u):$(id -g) \
-    -v `pwd`:/scratch --workdir /scratch -e HOME=/scratch \
-    edm2:latest \
-    python generate_images.py --preset=edm2-img512-s-guid-dino --outdir=out
+```bash
+PY=D:/Work/GrowthNet_gamailab/GrowthNet/projects/vivit/tien_rivanna_repo/.pixi/envs/default/python.exe
 ```
 
-If you hit an error, please ensure you have correctly installed the [NVIDIA container runtime](https://docs.docker.com/config/containers/resource_constraints/#gpu). See [NVIDIA PyTorch container release notes](https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-24-02.html#rel-24-02) for driver compatibility details.
+### 1. Token store (ViViT repo, not this repo)
 
-Breakdown of the `docker run` command line:
+A frozen ViViT encoder produces per-scan ViT spatial tokens, tapped before
+its temporal blocks (the temporal blocks collapse the representation to
+near-constant, see `docs/vivit_conditioning_plan.md` section 1.2). The
+store is built by a script in the ViViT repo and lives outside this repo;
+this repo only reads it. Layout and contents (256 x 768 float16 tokens per
+scan, the scan's own mask/image in the crop frame, affine, spacing, and
+split membership) are pinned in `docs/vivit_pipeline_contracts.md` contract
+C2. Every consumer in this repo reads `spacing` from the store rather than
+assuming a fixed value (see contract C0: the store's true voxel spacing is
+0.5 x 0.5 x 1.0 mm, not the originally intended 1 x 1 x 2 mm).
 
-- `--gpus all -it --rm --user $(id -u):$(id -g)`: With all GPUs enabled, run an interactive session with current user's UID/GID to avoid Docker writing files as root.
-- ``-v `pwd`:/scratch --workdir /scratch``: Mount current running dir (e.g., the top of this git repo on your host machine) to `/scratch` in the container and use that as the current working dir.
-- `-e HOME=/scratch`: Specify where to cache temporary files. If you want more fine-grained control, you can instead set `DNNLIB_CACHE_DIR` (for pre-trained model download cache). You want these cache dirs to reside on persistent volumes so that their contents are retained across multiple `docker run` invocations.
+### 2. Pair dataset
 
-## Using pre-trained models
-
-We provide pre-trained models for our proposed EDM2 configuration (config G) for different model sizes trained with ImageNet-512 and ImageNet-64. To generate images using a given model, run:
-
-```.bash
-# Generate a couple of images and save them as out/*.png
-python generate_images.py --preset=edm2-img512-s-guid-dino --outdir=out
+```bash
+$PY prepare_data_vivit_pairs.py \
+    --tokens-dir D:/Work/GrowthNet_gamailab/GrowthNet/projects/vivit/tien_rivanna_repo/growth_classifier_v0005/out/vit_tokens_trainframe \
+    --out datasets/vivit_pairs \
+    --pairing consecutive --max-history 4
 ```
 
-The above command automatically downloads the necessary models and caches them under `$HOME/.cache/dnnlib`, which can be overridden by setting the `DNNLIB_CACHE_DIR` environment variable. The `--preset=edm2-img512-s-guid-dino` option indicates that we will be using the S-sized EDM2 model, trained with ImageNet-512 and sampled using guidance, with EMA length and guidance strength chosen to minimize FD<sub>DINOv2</sub>. The following presets are supported:
+Builds `{split}/{idx:08d}.npz` samples (history scans paired with a later
+target scan, contract C3) plus `dataset.json` with the manifest and target
+statistics used as `sigma_data`. `--pairing all` uses every `i < j` history/
+target combination per patient instead of only consecutive scans, to enlarge
+the training set. Pass `--manifest <flow pair_manifest.csv>` instead of
+`--pairing`/`--splits`/`--max-history` to build only a test split aligned to
+the flow repo's own baseline/target pairs (Phase 5, history is always the
+single baseline scan); see `analysis/README.md` for that invocation.
 
-```
-# EDM2 paper
-edm2-img512-{xs|s|m|l|xl|xxl}-fid              # Table 2, minimize fid
-edm2-img512-{xs|s|m|l|xl|xxl}-dino             # Table 5, minimize fd_dinov2
-edm2-img64-{s|m|l|xl}-fid                      # Table 3, minimize fid
-edm2-img512-{xs|s|m|l|xl|xxl}-guid-{fid|dino}  # Table 2, classifier-free guidance
+### 3. Training
 
-# Autoguidance paper
-edm2-img512-{s|xxl}-autog-{fid|dino}           # Table 1, conditional ImageNet-512
-edm2-img512-s-uncond-autog-{fid|dino}          # Table 1, unconditional ImageNet-512
-edm2-img64-s-autog-{fid|dino}                  # Table 1, conditional ImageNet-64
-```
-
-Each of these maps to a specific set of options that point to the models in [https://nvlabs-fi-cdn.nvidia.com/edm2/posthoc-reconstructions/](https://nvlabs-fi-cdn.nvidia.com/edm2/posthoc-reconstructions/). For example, `--preset=edm2-img512-xxl-guid-dino` is equivalent to:
-
-```.bash
-# Expanded command line for --preset=edm2-img512-xxl-guid-dino
-python generate_images.py \
-    --net=https://nvlabs-fi-cdn.nvidia.com/edm2/posthoc-reconstructions/edm2-img512-xxl-0939524-0.015.pkl \
-    --gnet=https://nvlabs-fi-cdn.nvidia.com/edm2/posthoc-reconstructions/edm2-img512-xs-uncond-2147483-0.015.pkl \
-    --guidance=1.7 \
-    --outdir=out
+```bash
+$PY train_edm2.py --outdir=training-runs/00000 \
+    --data=datasets/vivit_pairs \
+    --tokens-dir=D:/Work/GrowthNet_gamailab/GrowthNet/projects/vivit/tien_rivanna_repo/growth_classifier_v0005/out/vit_tokens_trainframe \
+    --channels=16 --channel-mult=1,2,2,4 --num-blocks=2 \
+    --channels-per-head=32 --attn-resolutions=16 --cross-attn-resolutions=16,32 \
+    --dropout=0.1 --duration=160Ki --batch=4 --batch-gpu=4 \
+    --lr=0.01 --decay=35000 --P_mean=-0.4 --P_std=1.0
 ```
 
-In other words, we will use the XXL-sized conditional model at 939524 kimg and EMA length 0.015, and guide it with respect to the XS-sized unconditional model at 2147483 kimg with guidance strength 1.7. For further details, see `config_presets` in [`generate_images.py`](./generate_images.py).
+To resume, run the exact same command again; the script finds the
+highest-numbered checkpoint in `--outdir` automatically. Run `python
+train_edm2.py --help` for the full flag list; it is reproduced below where
+it documents pipeline- and architecture-specific behavior not obvious from
+upstream EDM2.
 
-## Calculating FLOPs and metrics
+**Architecture flags and the plan's initial configuration.** Upstream EDM2
+only exposes architecture through named `--preset` bundles; this fork adds
+the underlying flags directly since the training set here (on the order of
+160 pairs) needs a much smaller network than any upstream preset, tuned by
+hand instead of picked from a table:
 
-The computational cost of a given model can be estimated using `count_flops.py`:
+| flag | initial value | meaning |
+|---|---|---|
+| `--channels` | `16` | base channel count (upstream minimum was 16; this fork allows down to 8) |
+| `--channel-mult` | `1,2,2,4` | per-resolution channel multiplier, comma list |
+| `--num-blocks` | `2` | residual blocks per resolution |
+| `--attn-resolutions` | `16` | self-attention resolutions, comma list |
+| `--cross-attn-resolutions` | `16,32` | resolutions that get a cross-attention step against the ViViT tokens (decoupled from self-attention; see `docs/vivit_conditioning_plan.md` decision 7) |
+| `--channels-per-head` | `32` | channels per attention head, self- and cross-attention; the upstream default of 64 gives this small a model zero attention heads |
+| `--dropout` | `0.1` | |
 
-```.bash
-# Calculate FLOPs for a given model
-python count_flops.py \
-    https://nvlabs-fi-cdn.nvidia.com/edm2/posthoc-reconstructions/edm2-img512-s-2147483-0.130.pkl
+This is about 4.2M parameters before the shared token projection, 3.55M
+after it (see `docs/vivit_conditioning_plan.md` section 2.8 and its revision
+log for the measured cost of each cross-attention configuration, and for the
+scale-up/scale-down path if this configuration under- or overfits).
+
+**Gradient accumulation: `--batch` vs `--batch-gpu`.** `--batch` is the total
+(logical) batch size and determines the effective step; changing it changes
+training dynamics (loss scale, learning-rate schedule interaction) exactly
+as in upstream EDM2. `--batch-gpu` limits the physical micro-batch size per
+forward/backward pass; the script accumulates gradients over `--batch /
+--batch-gpu` micro-batches before each optimizer step. Changing `--batch-gpu`
+alone (to fit GPU memory) does not change training dynamics and is always
+safe; changing `--batch` does. On the RTX 5090 (32 GB) `--batch=4
+--batch-gpu=4` (no accumulation) fits the plan's initial architecture at
+about 11 GB peak.
+
+**`--context` / `--no-context`.** Token conditioning (cross-attention plus
+the pooled FiLM term) is on by default. `--no-context` builds a token-free
+network (`context_dim=0`) and skips all token I/O entirely, rather than just
+zeroing the tokens at run time. This is not an ablation convenience: the
+Phase 0 classifier probe on the re-extracted ViT tokens came back at chance
+(see `docs/vivit_pipeline_contracts.md` C0 and the plan's revision log), so a
+no-context trained arm is a required comparison, not optional, until token
+conditioning is shown to help.
+
+### 4. Checkpoint selection
+
+```bash
+$PY select_checkpoint.py \
+    --run-dir training-runs/00000 \
+    --data datasets/vivit_pairs --split val \
+    --num-samples 8 --steps 18
 ```
 
-To calculate FID and FD<sub>DINOv2</sub>, we first need to generate 50,000 random images. This can be quite time-consuming in practice, so it makes sense to distribute the workload across multiple GPUs. This can be done by launching `generate_images.py` through `torchrun`:
+Evaluates every (or every k-th, via `--every-k`) snapshot in a run directory
+on the validation split with a cheap sample/step budget and reports the best
+by consensus Dice, writing `val_selection.csv`. Checkpoint selection is
+always on val Dice, never on the diffusion training loss.
 
-```.bash
-# Generate 50000 images using 8 GPUs and save them as out/*/*.png
-torchrun --standalone --nproc_per_node=8 generate_images.py \
-    --preset=edm2-img512-s-guid-fid --outdir=out --subdirs --seeds=0-49999
+### 5. Generation (with required knockouts)
+
+```bash
+$PY generate_forecasts.py \
+    --net training-runs/00000/network-snapshot-XXXXXXX-0.XXX.pkl \
+    --data datasets/vivit_pairs --split test \
+    --out generations/test_none \
+    --num-samples 32 --steps 32 --knockout none
 ```
 
-Alternatively, `generate_images.py` can be launched as a multi-GPU or multi-node job in a compute cluster. This should work out-of-the-box as long as the cluster environment spawns a separate process for each GPU and populates the necessary environment variables. For further details, please refer to the [`torchrun`](https://pytorch.org/docs/stable/elastic/run.html) documetation.
+`--knockout` controls what conditioning the network actually receives at
+sampling time, independent of how it was trained:
 
-Having generated 50,000 images, FID and FD<sub>DINOv2</sub> can then be calculated using `calculate_metrics.py`:
+| value | effect |
+|---|---|
+| `none` | full conditioning (default) |
+| `no-context` | drop the ViViT tokens (cross-attention and pooled FiLM skipped) |
+| `no-cond-image` | drop the concatenated baseline mask/image channels |
+| `shuffle-tokens` | swap in another patient's tokens, same time gap |
+| `fixed-time` | freeze `delta_days` to a fixed value (train median by default, `--fixed-delta-days` to override) |
+| `no-context-no-cond` | drop both tokens and the conditioning image |
 
-```.bash
-# Calculate metrics for a random subset of 50000 images in out/
-python calculate_metrics.py calc --images=out \
-    --ref=https://nvlabs-fi-cdn.nvidia.com/edm2/dataset-refs/img512.pkl
+Every one of these knockouts must be run and compared against `none` before
+any claim that the model uses its conditioning: the FlowMatchingGrowthNet
+project (the lab's related flow-matching effort) found a model that could
+ignore its conditioning entirely and still score well, purely from the
+target distribution's own structure. A favorable Dice with no knockout
+comparison is not evidence of conditioning use.
+
+### 6. Evaluation
+
+```bash
+$PY evaluate_forecasts.py --gen-dir generations/test_none
 ```
 
-Here, the `--ref` option points to pre-computed reference statistics for the dataset that the model was originally trained with. The necessary reference statistics for our pre-trained models are available at [https://nvlabs-fi-cdn.nvidia.com/edm2/dataset-refs/](https://nvlabs-fi-cdn.nvidia.com/edm2/dataset-refs/).
+Writes `pair_metrics.csv` and `summary.json` next to (or under `--out`) the
+generation directory: Dice, surface Dice, volume error, growth/shrink
+direction accuracy, and probabilistic metrics over the sampled forecasts,
+compared against carry-forward and (where available) the flow repo's
+deterministic forecaster.
 
-Note that the numerical values of the metrics vary across different random seeds and are highly sensitive to the number of images. By default, `calculate_metrics.py` uses 50,000 generated images, in line with established best practices. Providing fewer images will result in an error, whereas providing more will use a random subset. To reduce the effect of random variation, we recommend repeating the calculation multiple times with different random seeds, e.g., `--seeds=0-49999`, `--seeds=50000-99999`, and `--seeds=100000-149999`. In our paper, we calculated each metric multiple times and reported the minimum.
+### 7. Flow-repo comparison deck (Phase 5, optional)
 
-When performing larger sweeps over, say, EMA lengths or training snapshots, it may be impractical to use `generate_images.py` as outlined above. As an alternative, the metrics can also be calculated directly for a given network pickle, generating the necessary images on the fly:
+Once a trained checkpoint clears the knockout checks, `tools/export_flow_analysis.py`
+(run under the flow repo's `uv` environment; it imports `tumor_flow.*` to
+score both models with identical code), `tools/make_flow_recipe.py`, and
+`tools/build_flow_deck.sh` build a side-by-side PowerPoint comparing this
+fork's best EDM2 model against the best FlowMatchingGrowthNet model on
+shared test scans. Full commands, the alignment-check design, and known
+data-provenance caveats (the two cohorts' annotations do not always agree)
+are in `analysis/README.md`; that file is the place results eventually get
+reported, not this one.
 
-```.bash
-# Calculate metrics directly for a given model without saving any images
-torchrun --standalone --nproc_per_node=8 calculate_metrics.py gen \
-    --net=https://nvlabs-fi-cdn.nvidia.com/edm2/posthoc-reconstructions/edm2-img512-s-2147483-0.130.pkl \
-    --ref=https://nvlabs-fi-cdn.nvidia.com/edm2/dataset-refs/img512.pkl \
-    --seed=123456789
+## Testing
+
+```bash
+$PY -m pytest tests/
 ```
 
-We also provide the necessary APIs to do these kinds of operations programmatically from external Python scripts. For further details, see `gen()` in [`calculate_metrics.py`](./calculate_metrics.py).
+Covers dataset shapes and split isolation, network forward passes at
+128x128x64 with variable history length, a CPU-only regression test for a
+zero-init gradient deadlock in cross-attention, the training loop and the
+real `train_edm2.py` CLI path, and `prepare_data_vivit_pairs.py`. Tests that
+build a real network are `@pytest.mark.skipif(not torch.cuda.is_available())`.
 
-## Post-hoc EMA reconstruction
+`tests/test_export_flow_analysis.py` is the one exception: it imports
+`tumor_flow` (the flow repo's package) and must be run with the flow repo's
+own interpreter instead, or it skips itself:
 
-The models in [https://nvlabs-fi-cdn.nvidia.com/edm2/posthoc-reconstructions/](https://nvlabs-fi-cdn.nvidia.com/edm2/posthoc-reconstructions/) correspond to specific choices for the EMA length. In addition, we also provide the raw snapshots for each training run in [https://nvlabs-fi-cdn.nvidia.com/edm2/raw-snapshots/](https://nvlabs-fi-cdn.nvidia.com/edm2/raw-snapshots/) that can be used to reconstruct arbitrary EMA profiles.
-
-Note that the raw snapshots can take up a considerable amount of disk space. In the paper, we saved snapshots every 8Mi (= 8 [mebi](https://en.wikipedia.org/wiki/Binary_prefix#mebi) = 8&times;2<sup>20</sup>) training images, corresponding to 118&ndash;635 GB of data per training run depending on model size. In [https://nvlabs-fi-cdn.nvidia.com/edm2/raw-snapshots/](https://nvlabs-fi-cdn.nvidia.com/edm2/raw-snapshots/), we provide the snapshots at 32Mi intervals instead, corresponding to 30&ndash;159 GB per training run. We have done extensive testing to verify that this is sufficient for accurate reconstruction.
-
-To reconstruct new EMA profiles, the first step is to download the raw snapshots corresponding to a given training run. We recommend using [Rclone](https://rclone.org/install/) for this:
-
-```.bash
-# Download raw snapshots for the pre-trained edm2-img512-xs model
-rclone copy --progress --http-url https://nvlabs-fi-cdn.nvidia.com/edm2 \
-    :http:raw-snapshots/edm2-img512-xs/ raw-snapshots/edm2-img512-xs/
+```bash
+uv run --project D:/Work/GrowthNet_gamailab/FlowMatchingGrowthNet python -m pytest \
+    tests/test_export_flow_analysis.py -v
 ```
 
-The above command downloads 128 network pickles, 238 MB each, yielding 29.8 GB in total. Once the download is complete, new EMA profiles can be reconstructed using `reconstruct_phema.py`:
+## What changed from upstream
 
-```.bash
-# Reconstruct a new EMA profile with std=0.150
-python reconstruct_phema.py --indir=raw-snapshots/edm2-img512-xs \
-    --outdir=out --outstd=0.150
-```
+- **3D-only UNet.** `training/networks_edm2.py` uses 3D convolutions, 3D
+  resampling, and 5D (`B, C, X, Y, Z`) preconditioning throughout. The 2D
+  path is gone; the network can no longer run on 2D images.
+- **`PairDataset` replaces `ImageFolderDataset`.** `training/dataset.py`
+  loads `(history scans, target scan)` pairs produced by
+  `prepare_data_vivit_pairs.py`, not a flat labeled image folder, and reads
+  ViViT tokens from the C2 token store at run time rather than from a
+  dataset zip.
+- **Conditioning paths added throughout the network and loss**: a
+  concatenated baseline-mask/image input channel, cross-attention against
+  variable-length ViViT token histories with a key-padding mask, a pooled-
+  token FiLM term, and an explicit time-gap (and per-history-scan age)
+  embedding. See `docs/vivit_pipeline_contracts.md` contracts C5-C6 for the
+  exact batch dict and network API.
+- **Deleted scripts** (ImageNet/2D-specific, no longer applicable): `dataset_tool.py`,
+  `calculate_metrics.py`, `generate_images.py`, `count_flops.py`,
+  `prepare_data_3d.py`, `prepare_data_3d_longitudinal.py`,
+  `prepare_embeddings.py`, `prepare_test_generation.py`,
+  `postprocess_test_generations.py`, `run_train_3d.sh`, `view_napari.py`.
+  Their replacements are `prepare_data_vivit_pairs.py`,
+  `generate_forecasts.py`, `evaluate_forecasts.py`, and `select_checkpoint.py`.
+- **Single-process launch on Windows.** `torch_utils/distributed.py`'s
+  `init()` works without `torchrun` when there is exactly one process, so
+  `train_edm2.py` runs directly (`python train_edm2.py ...`) for the local,
+  single-GPU RTX 5090 setup this fork targets; multi-GPU (Rivanna) still
+  uses `torchrun --standalone --nproc_per_node=N`.
 
-This reads each of the input pickles once and saves the reconstructed model at `out/phema-2147483-0.150.pkl`, to be used with, e.g., `generate_images.py`. To perform a sweep over EMA length, it is also possible reconstruct multiple EMA profiles simultaneously:
-
-```.bash
-# Reconstruct a set of 31 EMA profiles, streaming over the input data 4 times
-python reconstruct_phema.py --indir=raw-snapshots/edm2-img512-xs \
-    --outdir=out --outstd=0.010,0.015,...,0.250 --batch=8
-```
-
-See [`python reconstruct_phema.py --help`](./docs/phema-help.txt) for the full list of options.
-
-Note that our post-hoc EMA approach is not specific to diffusion models in any way &mdash; it can be applied to other kinds of deep learning models as well. To try it out in your own training runs, you can **(1)** include [`training/phema.py`](./training/phema.py) in your codebase, **(2)** modify your training loop to use `phema.PowerFunctionEMA`, and **(3)** take a copy of [`reconstruct_phema.py`](./reconstruct_phema.py) and modify it to suit your needs.
-
-## Preparing datasets
-
-Datasets are stored as uncompressed ZIP archives containing uncompressed PNG or NPY files, along with a metadata file `dataset.json` for labels. When using latent diffusion, it is necessary to create two different versions of a given dataset: the original RGB version, used for evaluation, and a VAE-encoded latent version, used for training.
-
-To set up ImageNet-512:
-
-1. Download the ILSVRC2012 data archive from [Kaggle](https://www.kaggle.com/competitions/imagenet-object-localization-challenge/data) and extract it somewhere, e.g., `downloads/imagenet`.
-
-2. Crop and resize the images to create the original RGB dataset:
-
-```.bash
-# Convert raw ImageNet data to a ZIP archive at 512x512 resolution
-python dataset_tool.py convert --source=downloads/imagenet/ILSVRC/Data/CLS-LOC/train \
-    --dest=datasets/img512.zip --resolution=512x512 --transform=center-crop-dhariwal
-```
-
-3. Run the images through a pre-trained VAE encoder to create the corresponding latent dataset:
-
-```.bash
-# Convert the pixel data to VAE latents
-python dataset_tool.py encode --source=datasets/img512.zip \
-    --dest=datasets/img512-sd.zip
-```
-
-4. Calculate reference statistics for the original RGB dataset, to be used with `calculate_metrics.py`:
-
-```.bash
-# Compute dataset reference statistics for calculating metrics
-python calculate_metrics.py ref --data=datasets/img512.zip \
-    --dest=dataset-refs/img512.pkl
-```
-
-## Training new models
-
-New models can be trained using `train_edm2.py`. For example, to train an XS-sized conditional model for ImageNet-512 using the same hyperparameters as in our paper, run:
-
-```.bash
-# Train XS-sized model for ImageNet-512 using 8 GPUs
-torchrun --standalone --nproc_per_node=8 train_edm2.py \
-    --outdir=training-runs/00000-edm2-img512-xs \
-    --data=datasets/img512-sd.zip \
-    --preset=edm2-img512-xs \
-    --batch-gpu=32
-```
-
-This example performs single-node training using 8 GPUs, but in practice, we recommend using at least 32 A100 GPUs, i.e., 4 DGX nodes. Note that training large models may easily run out of GPU memory, depending on the number of GPUs and the available VRAM. The best way to avoid this is to limit the per-GPU batch size using gradient accumulation. In the above example, the total batch size is 2048 images, i.e., 256 per GPU, but we limit it to 32 per GPU by specifying `--batch-gpu=32`. Modifying `--batch-gpu` is safe in the sense that it has no interaction with the other hyperparameters, whereas modifying the total batch size would also necessitate adjusting, e.g., the learning rate.
-
-By default, the training script prints status every 128Ki (= 128 [kibi](https://en.wikipedia.org/wiki/Binary_prefix#kibi) = 128&times;2<sup>10</sup>) training images (controlled by `--status`), saves network snapshots every 8Mi (= 8&times;2<sup>20</sup>) training images (controlled by `--snapshot`), and dumps training checkpoints every 128Mi training images (controlled by `--checkpoint`). The status is saved in `log.txt` (one-line summary) and `stats.json` (comprehensive set of statistics). The network snapshots are saved in `network-snapshot-*.pkl`, and they can be used directly with, e.g., `generate_images.py` and `reconstruct_phema.py`.
-
-The training checkpoints, saved in `training-state-*.pt`, can be used to resume the training at a later time.
-When the training script starts, it will automatically look for the highest-numbered checkpoint and load it if available. To resume training, simply run the same `train_edm2.py` command line again &mdash; it is important to use the same set of options to avoid accidentally changing the hyperparameters mid-training. If you wish to have the ability to suspend the training at any time so that no progress is lost, you can modify the `should_suspend()` function in [torch_utils/distributed.py](./torch_utils/distributed.py) to implement the desired signaling protocol.
-
-See [`python train_edm2.py --help`](./docs/train-help.txt) for the full list of options.
-
-## 2D toy example
-
-The 2D toy example used in the autoguidance paper can be reproduced with `toy_example.py`:
-
-```.bash
-# Visualize sampling distributions using autoguidance.
-python toy_example.py plot
-```
-
-See [`python toy_example.py --help`](./docs/toy-help.txt) for the full list of options.
-
-![2D toy example](./docs/toy-example.jpg)
-
-## License
-
-Copyright &copy; 2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-
-All material, including source code and pre-trained models, is licensed under the [Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International License](http://creativecommons.org/licenses/by-nc-sa/4.0/).
+For the full design rationale (why these choices, what was tried and
+rejected, known defects fixed along the way, and the phased implementation
+plan) see `docs/vivit_conditioning_plan.md`; for the frozen data/API
+contracts every component implements see `docs/vivit_pipeline_contracts.md`.
 
 ## Citation
 
@@ -249,10 +274,12 @@ All material, including source code and pre-trained models, is licensed under th
 }
 ```
 
-## Development
+## License
 
-This is a research reference implementation and is treated as a one-time code drop. As such, we do not accept outside code contributions in the form of pull requests.
+Copyright (c) 2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-## Acknowledgments
-
-We thank Eric Chan, Qinsheng Zhang, Erik H&auml;rk&ouml;nen, Arash Vahdat, Ming-Yu Liu, David Luebke, and Alex Keller for discussions and comments, and Tero Kuosmanen and Samuel Klenberg for maintaining our compute infrastructure.
+All material, including source code and pre-trained models, is licensed
+under the [Creative Commons Attribution-NonCommercial-ShareAlike 4.0
+International License](http://creativecommons.org/licenses/by-nc-sa/4.0/).
+This fork inherits that license; it is a research reference implementation
+for internal lab use, not a redistributed product.

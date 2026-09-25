@@ -5,278 +5,217 @@
 # You should have received a copy of the license along with this
 # work. If not, see http://creativecommons.org/licenses/by-nc-sa/4.0/
 
-"""Streaming images and labels from datasets created with dataset_tool.py."""
+"""Streaming (history, target) pairs from a dataset built by
+prepare_data_vivit_pairs.py (contract C3 in docs/vivit_pipeline_contracts.md),
+with ViViT context tokens loaded from the token store (contract C2) at run
+time. Returns the batch dict of contract C5."""
 
 import os
-import numpy as np
-import zipfile
-import PIL.Image
 import json
+import numpy as np
 import torch
-import dnnlib
 
-try:
-    import pyspng
-except ImportError:
-    pyspng = None
+from training.encodings import encode_target, encode_cond_image
 
 #----------------------------------------------------------------------------
-# Abstract base class for datasets.
+# Dataset of (history, target) pairs for the ViViT-conditioned EDM2 pipeline.
 
-class Dataset(torch.utils.data.Dataset):
+class PairDataset(torch.utils.data.Dataset):
     def __init__(self,
-        name,                   # Name of the dataset.
-        raw_shape,              # Shape of the raw image data (NCHW).
-        use_labels  = True,     # Enable conditioning labels? False = label dimension is zero.
-        max_size    = None,     # Artificially limit the size of the dataset. None = no limit. Applied before xflip.
-        xflip       = False,    # Artificially double the size of the dataset via x-flips. Applied after max_size.
-        random_seed = 0,        # Random seed to use when applying max_size.
-        cache       = False,    # Cache images in CPU memory?
+        path,                       # Root directory produced by prepare_data_vivit_pairs.py.
+        tokens_dir      = None,     # C2 token store root. None = read from dataset.json.
+        split           = 'train',  # 'train', 'val', or 'test'.
+        target_encoding = 'binary', # 'binary' or 'sdf' (contract C4).
+        cond_image      = 'mask',   # 'none', 'mask', or 'mask+image' (contract C4).
+        max_history     = None,     # Pad/truncate history to this many scans. None = dataset.json's max_history.
+        token_key       = 'tokens', # Which C2 token array to read ('tokens', 'tokens_l3', 'tokens_l6', 'tokens_l9').
+        flip_axes       = False,    # Random per-axis flips, applied identically to image and cond_image.
+        cache_tokens    = True,     # Cache loaded token arrays in process memory (they are read-only and shared).
+        sigma_data      = None,     # Override sigma_data. None = read from dataset.json's train stats (default).
+        use_context     = True,     # False = never read tokens; items omit 'context'/'context_mask'/'context_ages'.
+        spacing         = None,     # Override voxel spacing (mm), e.g. for reconstruction from C7 metadata. None = read from dataset.json.
     ):
-        self._name = name
-        self._raw_shape = list(raw_shape)
-        self._use_labels = use_labels
-        self._cache = cache
-        self._cached_images = dict() # {raw_idx: np.ndarray, ...}
-        self._raw_labels = None
-        self._label_shape = None
+        if target_encoding not in ('binary', 'sdf'):
+            raise ValueError(f'unknown target_encoding: {target_encoding!r}')
+        if cond_image not in ('none', 'mask', 'mask+image'):
+            raise ValueError(f'unknown cond_image mode: {cond_image!r}')
 
-        # Apply max_size.
-        self._raw_idx = np.arange(self._raw_shape[0], dtype=np.int64)
-        if (max_size is not None) and (self._raw_idx.size > max_size):
-            np.random.RandomState(random_seed % (1 << 31)).shuffle(self._raw_idx)
-            self._raw_idx = np.sort(self._raw_idx[:max_size])
+        manifest_path = os.path.join(path, 'dataset.json')
+        if not os.path.isfile(manifest_path):
+            raise IOError(f'no dataset.json found under {path!r}')
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+        if split not in manifest['splits']:
+            raise IOError(f'split {split!r} not found in {manifest_path!r}')
 
-        # Apply xflip.
-        self._xflip = np.zeros(self._raw_idx.size, dtype=np.uint8)
-        if xflip:
-            self._raw_idx = np.tile(self._raw_idx, 2)
-            self._xflip = np.concatenate([self._xflip, np.ones_like(self._xflip)])
+        self._path = path
+        self._split = split
+        self._split_dir = os.path.join(path, split)
+        self._target_encoding = target_encoding
+        self._cond_image_mode = cond_image
+        self._token_key = token_key
+        self._flip_axes = bool(flip_axes) and split == 'train'
+        self._cache_tokens = cache_tokens
+        self._token_cache = {}
+        self._use_context = bool(use_context)
 
-    def _get_raw_labels(self):
-        if self._raw_labels is None:
-            self._raw_labels = self._load_raw_labels() if self._use_labels else None
-            if self._raw_labels is None:
-                self._raw_labels = np.zeros([self._raw_shape[0], 0], dtype=np.float32)
-            assert isinstance(self._raw_labels, np.ndarray)
-            assert self._raw_labels.shape[0] == self._raw_shape[0]
-            assert self._raw_labels.dtype in [np.float32, np.int64]
-            if self._raw_labels.dtype == np.int64:
-                assert self._raw_labels.ndim == 1
-                assert np.all(self._raw_labels >= 0)
-        return self._raw_labels
+        self._tokens_dir = tokens_dir if tokens_dir is not None else manifest['tokens_dir']
+        self._samples = manifest['splits'][split]['samples']
+        if len(self._samples) == 0:
+            raise IOError(f'split {split!r} has no samples in {manifest_path!r}')
+        self._resolution = tuple(int(s) for s in manifest['shape'])
+        # Physical voxel spacing (mm), for SDF encoding (contract C4/C0).
+        # C0 (2026-09-12): the re-extracted training-frame token store no
+        # longer has isotropic-ish (1,1,2) spacing -- every consumer must
+        # read it from the data, never hard-code it. `spacing` may be given
+        # explicitly (e.g. reconstructing from a checkpoint's C7 metadata,
+        # which already carries it), mirroring the sigma_data override below.
+        if spacing is not None:
+            self._spacing = tuple(float(s) for s in spacing)
+        else:
+            if 'spacing' not in manifest:
+                raise IOError(f"dataset.json is missing 'spacing' in {manifest_path!r} (contract C0/C4)")
+            self._spacing = tuple(float(s) for s in manifest['spacing'])
 
-    def close(self): # to be overridden by subclass
-        pass
+        manifest_max_history = manifest.get('max_history')
+        self._max_history = int(max_history) if max_history is not None else int(manifest_max_history)
 
-    def _load_raw_image(self, raw_idx): # to be overridden by subclass
-        raise NotImplementedError
+        if sigma_data is not None:
+            # Explicit override: e.g. generation/evaluation reconstructing a
+            # dataset from a checkpoint's C7 metadata, which already knows
+            # net.sigma_data and does not need (and may not have) a
+            # dataset.json stats block at all -- a test-only pair dir built
+            # from another repo's manifest can legitimately lack train stats.
+            self._sigma_data = float(sigma_data)
+        else:
+            # Default: sigma_data (and any other normalization stat) always
+            # comes from the TRAIN split's stats, regardless of which split
+            # this dataset serves (contract C3: dataset.json only ever has
+            # train-split stats -- val and test must never define their own
+            # normalization).
+            if 'train' not in manifest.get('stats', {}):
+                raise IOError(f"dataset.json is missing 'stats.train' in {manifest_path!r}")
+            stats = manifest['stats']['train']
+            rms_key = f'target_rms_{target_encoding}'
+            if rms_key not in stats:
+                raise IOError(f'{rms_key!r} missing from dataset.json train stats')
+            self._sigma_data = float(stats[rms_key])
 
-    def _load_raw_labels(self): # to be overridden by subclass
-        raise NotImplementedError
-
-    def __getstate__(self):
-        return dict(self.__dict__, _raw_labels=None)
-
-    def __del__(self):
-        try:
-            self.close()
-        except:
-            pass
+        self._cond_channels = {'none': 0, 'mask': 1, 'mask+image': 2}[cond_image]
 
     def __len__(self):
-        return self._raw_idx.size
+        return len(self._samples)
+
+    def _load_tokens(self, scan_id):
+        key = scan_id
+        cached = self._token_cache.get(key)
+        if cached is not None:
+            return cached
+        fpath = os.path.join(self._tokens_dir, self._split, f'{scan_id}.npz')
+        with np.load(fpath) as z:
+            tok = np.asarray(z[self._token_key], dtype=np.float32)
+        if self._cache_tokens:
+            self._token_cache[key] = tok
+        return tok
 
     def __getitem__(self, idx):
-        raw_idx = self._raw_idx[idx]
-        image = self._cached_images.get(raw_idx, None)
-        if image is None:
-            image = self._load_raw_image(raw_idx)
-            if self._cache:
-                self._cached_images[raw_idx] = image
-        assert isinstance(image, np.ndarray)
-        assert list(image.shape) == self._raw_shape[1:]
-        if self._xflip[idx]:
-            assert image.ndim in [3, 4]  # CHW or CDHW
-            image = image[..., ::-1]  # flip last spatial dim
-        return image.copy(), self.get_label(idx)
+        entry = self._samples[idx]
+        fpath = os.path.join(self._split_dir, f"{entry['idx']:08d}.npz")
+        with np.load(fpath) as z:
+            target_mask = z['target_mask']
+            cond_mask = z['cond_mask']
+            cond_image_arr = z['cond_image'] if 'cond_image' in z.files else None
+            delta_days = float(np.asarray(z['delta_days']))
+            if self._use_context:
+                history_scan_ids = [s.decode() if isinstance(s, bytes) else str(s) for s in z['history_scan_ids']]
+                history_ages = np.asarray(z['history_ages_days'], dtype=np.float32)
 
-    def get_label(self, idx):
-        label = self._get_raw_labels()[self._raw_idx[idx]]
-        if label.dtype == np.int64:
-            onehot = np.zeros(self.label_shape, dtype=np.float32)
-            onehot[label] = 1
-            label = onehot
-        return label.copy()
+        image = encode_target(target_mask, self._target_encoding, spacing=self._spacing)[np.newaxis, ...] # (1,D,H,W)
+        cond_image = encode_cond_image(cond_mask, cond_image_arr, self._cond_image_mode) # (C,D,H,W)
 
-    def get_details(self, idx):
-        d = dnnlib.EasyDict()
-        d.raw_idx = int(self._raw_idx[idx])
-        d.xflip = (int(self._xflip[idx]) != 0)
-        d.raw_label = self._get_raw_labels()[d.raw_idx].copy()
-        return d
+        if self._flip_axes:
+            flip_dims = [1 + ax for ax in range(3) if np.random.rand() < 0.5] # +1: skip channel dim
+            if flip_dims:
+                image = np.flip(image, axis=flip_dims).copy()
+                if cond_image.shape[0] > 0:
+                    cond_image = np.flip(cond_image, axis=flip_dims).copy()
 
-    @property
-    def name(self):
-        return self._name
+        item = dict(
+            image=image.astype(np.float32),
+            cond_image=cond_image.astype(np.float32),
+            delta_days=np.float32(delta_days),
+            idx=np.int64(entry['idx']),
+        )
 
-    @property
-    def image_shape(self): # [CHW]
-        return list(self._raw_shape[1:])
+        if self._use_context:
+            # Zero-padded to `max_history`, oldest-first, most recent
+            # `max_history` scans kept if the sample's own history is longer.
+            # Skipped entirely when use_context is False, to avoid the K
+            # per-scan token-file reads (the whole point of --no-context).
+            K = self._max_history
+            n_hist = len(history_scan_ids)
+            keep_ids = history_scan_ids[-K:] if n_hist > K else history_scan_ids
+            keep_ages = history_ages[-K:] if n_hist > K else history_ages
+            n_keep = len(keep_ids)
 
-    @property
-    def num_channels(self):
-        assert len(self.image_shape) in [3, 4]  # CHW or CDHW
-        return self.image_shape[0]
+            context = np.zeros((K, 256, 768), dtype=np.float32)
+            context_mask = np.zeros((K,), dtype=bool)
+            context_ages = np.zeros((K,), dtype=np.float32)
+            for i in range(n_keep):
+                tok = self._load_tokens(keep_ids[i])
+                context[i] = tok
+                context_mask[i] = True
+                context_ages[i] = keep_ages[i]
+
+            item['context'] = context
+            item['context_mask'] = context_mask
+            item['context_ages'] = context_ages
+
+        return item
 
     @property
     def resolution(self):
-        assert len(self.image_shape) in [3, 4]  # CHW or CDHW
-        if len(self.image_shape) == 4:  # CDHW
-            assert self.image_shape[1] == self.image_shape[2] == self.image_shape[3]
-            return self.image_shape[1]
-        assert self.image_shape[1] == self.image_shape[2]
-        return self.image_shape[1]
+        return self._resolution
 
     @property
-    def label_shape(self):
-        if self._label_shape is None:
-            raw_labels = self._get_raw_labels()
-            if raw_labels.dtype == np.int64:
-                self._label_shape = [int(np.max(raw_labels)) + 1]
-            else:
-                self._label_shape = raw_labels.shape[1:]
-        return list(self._label_shape)
+    def spacing(self):
+        return self._spacing
 
     @property
-    def label_dim(self):
-        return self.label_shape[-1]
+    def num_channels(self):
+        return 1
 
     @property
-    def has_labels(self):
-        return any(x != 0 for x in self.label_shape)
+    def cond_channels(self):
+        return self._cond_channels
 
     @property
-    def has_onehot_labels(self):
-        return self._get_raw_labels().dtype == np.int64
+    def sigma_data(self):
+        return self._sigma_data
 
-#----------------------------------------------------------------------------
-# Dataset subclass that loads images recursively from the specified directory
-# or ZIP file.
+    @property
+    def max_history(self):
+        return self._max_history
 
-class ImageFolderDataset(Dataset):
-    def __init__(self,
-        path,                   # Path to directory or zip.
-        resolution      = None, # Ensure specific resolution, None = anything goes.
-        **super_kwargs,         # Additional arguments for the Dataset base class.
-    ):
-        self._path = path
-        self._zipfile = None
+    @property
+    def use_context(self):
+        return self._use_context
 
-        if os.path.isdir(self._path):
-            self._type = 'dir'
-            self._all_fnames = {os.path.relpath(os.path.join(root, fname), start=self._path) for root, _dirs, files in os.walk(self._path) for fname in files}
-        elif self._file_ext(self._path) == '.zip':
-            self._type = 'zip'
-            self._all_fnames = set(self._get_zipfile().namelist())
-        else:
-            raise IOError('Path must point to a directory or zip')
-
-        PIL.Image.init()
-        supported_ext = PIL.Image.EXTENSION.keys() | {'.npy'}
-        self._image_fnames = sorted(fname for fname in self._all_fnames if self._file_ext(fname) in supported_ext and os.path.basename(fname) != 'embeddings.npy')
-        if len(self._image_fnames) == 0:
-            raise IOError('No image files found in the specified path')
-
-        name = os.path.splitext(os.path.basename(self._path))[0]
-        raw_shape = [len(self._image_fnames)] + list(self._load_raw_image(0).shape)
-        if resolution is not None:
-            if len(raw_shape) == 5:  # NCDHW
-                if raw_shape[2] != resolution or raw_shape[3] != resolution or raw_shape[4] != resolution:
-                    raise IOError('Volume files do not match the specified resolution')
-            elif raw_shape[2] != resolution or raw_shape[3] != resolution:
-                raise IOError('Image files do not match the specified resolution')
-        super().__init__(name=name, raw_shape=raw_shape, **super_kwargs)
-
-    @staticmethod
-    def _file_ext(fname):
-        return os.path.splitext(fname)[1].lower()
-
-    def _get_zipfile(self):
-        assert self._type == 'zip'
-        if self._zipfile is None:
-            self._zipfile = zipfile.ZipFile(self._path)
-        return self._zipfile
-
-    def _open_file(self, fname):
-        if self._type == 'dir':
-            return open(os.path.join(self._path, fname), 'rb')
-        if self._type == 'zip':
-            return self._get_zipfile().open(fname, 'r')
-        return None
-
-    def close(self):
-        try:
-            if self._zipfile is not None:
-                self._zipfile.close()
-        finally:
-            self._zipfile = None
-
-    def __getstate__(self):
-        return dict(super().__getstate__(), _zipfile=None)
-
-    def _load_raw_image(self, raw_idx):
-        fname = self._image_fnames[raw_idx]
-        ext = self._file_ext(fname)
-        with self._open_file(fname) as f:
-            if ext == '.npy':
-                image = np.load(f)
-                if image.ndim == 3:
-                    # Could be DHW (3D volume) or HWC (2D image)
-                    # If first dim is small (<=4), treat as CHW; otherwise treat as DHW volume
-                    if image.shape[0] <= 4:
-                        pass  # already CHW
-                    else:
-                        image = image[np.newaxis, :, :, :]  # DHW -> CDHW
-                elif image.ndim == 4:
-                    pass  # already CDHW
-                else:
-                    image = image.reshape(-1, *image.shape[-2:])
-            elif ext == '.png' and pyspng is not None:
-                image = pyspng.load(f.read())
-                image = image.reshape(*image.shape[:2], -1).transpose(2, 0, 1)
-            else:
-                image = np.array(PIL.Image.open(f))
-                image = image.reshape(*image.shape[:2], -1).transpose(2, 0, 1)
-        return image
-
-    def _load_raw_labels(self):
-        fname = 'dataset.json'
-        if fname not in self._all_fnames:
-            return None
-        with self._open_file(fname) as f:
-            labels = json.load(f)['labels']
-        if labels is None:
-            return None
-
-        # Check for embeddings.npy (pre-computed VIVIT embeddings)
-        if 'embeddings.npy' in self._all_fnames:
-            with self._open_file('embeddings.npy') as f:
-                all_embeddings = np.load(f)  # (N, T, D) e.g. (N, 256, 768)
-
-            # labels entries are [filename, index] pairs — use index to reorder
-            labels_dict = dict(labels)
-            ordered_embeddings = np.stack([
-                all_embeddings[int(labels_dict[fname.replace('\\', '/')])]
-                for fname in self._image_fnames
-            ])
-            return ordered_embeddings.astype(np.float32)
-
-        # Fallback: standard label behavior
-        labels = dict(labels)
-        labels = [labels[fname.replace('\\', '/')] for fname in self._image_fnames]
-        labels = np.array(labels)
-        labels = labels.astype({1: np.int64, 2: np.float32}[labels.ndim])
-        return labels
+    @property
+    def dataset_kwargs(self):
+        """Constructor kwargs sufficient to reconstruct this dataset (contract C7)."""
+        return dict(
+            class_name='training.dataset.PairDataset',
+            path=self._path,
+            tokens_dir=self._tokens_dir,
+            split=self._split,
+            target_encoding=self._target_encoding,
+            cond_image=self._cond_image_mode,
+            max_history=self._max_history,
+            token_key=self._token_key,
+            flip_axes=self._flip_axes,
+            use_context=self._use_context,
+            spacing=self._spacing,
+        )
 
 #----------------------------------------------------------------------------
