@@ -1,0 +1,44 @@
+{
+ "old": {
+  "name": "Flow matching (D040)",
+  "checkpoint": "D:/Work/GrowthNet_gamailab/FlowMatchingGrowthNet/artifacts/hpsearch/stage23/ref300/recon_step00025500/flow_ema_00025500_0.100.pt",
+  "bullets": [
+   "Checkpoint sha256 4e8e52357161..."
+  ]
+ },
+ "new": {
+  "name": "EDM2 (mask + time gap, no ViT tokens)",
+  "checkpoint": "runs/C_binary_notokens/network-snapshot-0000098-0.050.pkl",
+  "bullets": [
+   "3.32M params, binary target, baseline mask + time gap conditioning, no ViT tokens",
+   "Arm C of three: trained the full 245 kimg budget, val-selected at kimg 98 (EMA 0.05)",
+   "Checkpoint sha256 7f0db34e9c45..."
+  ]
+ },
+ "eyebrow": "PHASE 5 - FINAL COMPARISON",
+ "headline": "consensus Dice 0.639 -> 0.576 (-0.064); consensus surface Dice 0.888 -> 0.786 (-0.102); per-sample Dice 0.555 -> 0.533 (-0.022)",
+ "takeaways": [
+  "Final checkpoints: all three EDM2 arms trained the full 245 kimg budget on the same pairs and were val-selected by consensus Dice (46 val pairs, carry-forward 0.721): C (binary target, no ViT tokens) 0.579 at kimg 98 EMA 0.05, featured here; B (SDF target + ViT tokens) 0.558 at kimg 12 EMA 0.05 and degrading steadily after that (later snapshots below 0.35); on the 25 shared test pairs, in EDM2's own scoring frame, B scores consensus Dice 0.577 vs C 0.580 and A 0.466 (carry-forward 0.677); A (binary target + ViT tokens) 0.460 at kimg 98 EMA 0.05. Evaluated here with 64 samples per pair vs the flow model's 1000.",
+  "Phase 4 conditioning ablations (25 test pairs over 18 patients, patient-level means, delta = knockout minus full context, 95% CI from a paired patient-level bootstrap, 2000 resamples, seed 2026): removing the baseline mask collapses both arms to an empty forecast (C 0.611 -> 0.000, delta -0.611 [-0.701, -0.499]; A 0.473 -> 0.000, delta -0.473 [-0.587, -0.354]); fixing the time gap at the train median of 682 days has no measurable effect (C 0.611 -> 0.604, delta -0.006 [-0.021, +0.010]; A 0.473 -> 0.486, delta +0.014 [-0.010, +0.038]); substituting another patient's ViT tokens has no measurable effect (A 0.473 -> 0.469, delta -0.003 [-0.011, +0.003]).",
+  "Interpretation: both arms rely on the baseline mask alone. The time gap and the ViT tokens are not measurably used (their 95% CIs straddle zero); the mask knockout is the only one whose CI excludes zero.",
+  "Phase 0 conditioning-signal probe (ViViT repo): no ViT tap showed growth-predictive signal on the frozen-encoder classifier probe -- best cross-validated ROC-AUC 0.52 vs 0.57 for the collapsed-embedding control -- consistent with tokens not improving forecast Dice here.",
+  "Bottom line: the diffusion forecaster trails flow D040 (consensus Dice 0.576 vs 0.639 on each model's own test pairs, flow frame; paired on the 25 shared pairs 0.576 vs 0.677, delta -0.101, 95% CI [-0.230, -0.007]) and its own carry-forward baseline on those 25 pairs (0.675; deterministic forecaster 0.667), and ViT-token conditioning is inert: the token arms (A, B) score no better than the no-token arm on val, and the knockouts show the tokens are not used.",
+  "Conditioning-knockout check on arm A (binary target + ViT tokens), same kimg 98 checkpoint: consensus Dice 0.473 (full context) -> 0.469 (another patient's tokens substituted), delta +0.003, 95% CI [-0.003, +0.011] (patient-level bootstrap, 2000 resamples, seed 2026, n=18 patients): the token arm does not use its tokens (95% CI straddles zero, no significant effect). The featured model here, EDM2 (mask + time gap, no ViT tokens), has no tokens by construction and was not itself part of this knockout."
+ ],
+ "extra_metrics": {
+  "old": {},
+  "new": {
+   "conditioning_knockout": {
+    "n_patients": 18,
+    "n_pairs": 25,
+    "consensus_dice_full_mean": 0.4727919655721653,
+    "consensus_dice_knockout_mean": 0.46934226774953874,
+    "delta_mean": 0.0034496978226264893,
+    "delta_ci_low": -0.003016043538784307,
+    "delta_ci_high": 0.011153280416783254,
+    "n_boot": 2000,
+    "seed": 2026
+   }
+  }
+ }
+}

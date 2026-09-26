@@ -52,3 +52,10 @@ runs/
 analysis/**/*.pptx
 analysis/**/panels/
 *.gif
+
+# Patient-level analysis outputs stay local; only analysis/README.md and the recipe JSONs are tracked
+analysis/**/*.csv
+analysis/**/viz/
+analysis/**/aggregate.json
+analysis/**/selected_patients.json
+analysis/**/viz_index.json

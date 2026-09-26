@@ -1,0 +1,42 @@
+{
+ "old": {
+  "name": "Flow matching (D040)",
+  "checkpoint": "D:/Work/GrowthNet_gamailab/FlowMatchingGrowthNet/artifacts/hpsearch/stage23/ref300/recon_step00025500/flow_ema_00025500_0.100.pt",
+  "bullets": [
+   "Checkpoint sha256 4e8e52357161..."
+  ]
+ },
+ "new": {
+  "name": "EDM2 (mask + time gap, no ViT tokens)",
+  "checkpoint": "D:/Work/GrowthNet_gamailab/edm2_gamai_lab/runs/C_binary_notokens/network-snapshot-0000098-0.050.pkl",
+  "bullets": [
+   "3.32M params, binary target, baseline mask + time gap conditioning, no ViT tokens",
+   "Checkpoint sha256 7f0db34e9c45...",
+   "INTERMEDIATE checkpoint: training paused at 98 kimg"
+  ]
+ },
+ "eyebrow": "PHASE 5 - INTERMEDIATE CHECKPOINT COMPARISON",
+ "headline": "consensus Dice 0.639 -> 0.576 (-0.064); consensus surface Dice 0.888 -> 0.786 (-0.102); per-sample Dice 0.555 -> 0.533 (-0.022)",
+ "takeaways": [
+  "Conditioning ablation: the ViT-token arm (A, same kimg 98 checkpoint stage) scored consensus Dice 0.466 on these 25 test pairs in EDM2's own scoring frame, versus 0.576 (flow-frame headline) for the no-tokens arm shown here -- ViT tokens did not help at this checkpoint.",
+  "Phase 0 conditioning-signal probe (ViViT repo): no ViT tap showed growth-predictive signal on the frozen-encoder classifier probe -- best cross-validated ROC-AUC 0.52 vs 0.57 for the collapsed-embedding control -- consistent with tokens not improving forecast Dice here.",
+  "INTERMEDIATE checkpoint: training paused at kimg 98 of a planned 245 (selected on val); evaluated here with 64 samples per pair vs the flow model's 1000.",
+  "Conditioning-knockout check on arm A (binary target + ViT tokens), same kimg 98 checkpoint: consensus Dice 0.473 (full context) -> 0.469 (another patient's tokens substituted), delta +0.003, 95% CI [-0.003, +0.011] (patient-level bootstrap, 2000 resamples, seed 2026, n=18 patients): the token arm does not use its tokens (95% CI straddles zero, no significant effect). The featured model here, EDM2 (mask + time gap, no ViT tokens), has no tokens by construction and was not itself part of this knockout."
+ ],
+ "extra_metrics": {
+  "old": {},
+  "new": {
+   "conditioning_knockout": {
+    "n_patients": 18,
+    "n_pairs": 25,
+    "consensus_dice_full_mean": 0.4727919655721653,
+    "consensus_dice_knockout_mean": 0.46934226774953874,
+    "delta_mean": 0.0034496978226264893,
+    "delta_ci_low": -0.003016043538784307,
+    "delta_ci_high": 0.011153280416783254,
+    "n_boot": 2000,
+    "seed": 2026
+   }
+  }
+ }
+}
